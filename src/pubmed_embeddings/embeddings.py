@@ -83,17 +83,38 @@ def _build_prompt(title: str, abstract: str) -> str:
     return f"{title.strip()} {abstract.strip()}"
 
 
+def _parse_embedding_vector(data: dict) -> list[float]:
+    """Ollama current API returns `embeddings` (batch); legacy returned `embedding`."""
+    if "embeddings" in data:
+        vecs = data["embeddings"]
+        if not vecs or not isinstance(vecs, list):
+            raise RuntimeError(f"Unexpected Ollama response (embeddings): {data!r}")
+        first = vecs[0]
+        if not isinstance(first, list):
+            raise RuntimeError(f"Unexpected Ollama response (embeddings[0]): {data!r}")
+        return first
+    emb = data.get("embedding")
+    if isinstance(emb, list):
+        return emb
+    raise RuntimeError(f"Unexpected Ollama response (no embeddings): {data!r}")
+
+
 def _fetch_ollama_embedding(
     client: httpx.Client,
     model: str,
-    prompt: str,
+    text: str,
 ) -> np.ndarray:
-    r = client.post("/api/embeddings", json={"model": model, "prompt": prompt})
+    # Current Ollama: POST /api/embed with {"model", "input"} — see https://docs.ollama.com/api/embed
+    r = client.post(
+        "/api/embed",
+        json={"model": model, "input": text, "truncate": True},
+    )
+    if r.status_code == 404:
+        # Older Ollama builds used /api/embeddings with "prompt"
+        r = client.post("/api/embeddings", json={"model": model, "prompt": text})
     r.raise_for_status()
     data = r.json()
-    emb = data.get("embedding")
-    if not emb or not isinstance(emb, list):
-        raise RuntimeError(f"Unexpected Ollama response (no embedding list): {data!r}")
+    emb = _parse_embedding_vector(data)
     arr = np.asarray(emb, dtype=np.float32).reshape(1, -1)
     if arr.size == 0:
         raise RuntimeError("Empty embedding from Ollama")

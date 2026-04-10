@@ -107,12 +107,14 @@ The extractor sets WAL mode, a large page cache, memory temp store, and `synchro
 Build **one FAISS index per embedding model** (different models have different vector dimensions, so indexes are not mixed). Each run uses rows from `articles` where **both** `title` and `abstract` are present; the embedded text is `title` + space + `abstract`.
 
 1. Copy [`.env.example`](.env.example) to `.env` and set `OLLAMA_BASE_URL`, `EMBEDDING_MODEL` (and optionally `EMBEDDING_SOURCE=ollama`).
-2. Pull the model in Ollama, e.g. `ollama pull bge-m3`.
+2. Pull the model in Ollama, e.g. `ollama pull bge-m3` or `ollama pull bge-large-en-v1.5`.
 3. Run:
 
 ```bash
 uv run pubmed-embed --data-dir data
 ```
+
+`pubmed-embed` calls Ollama’s [`POST /api/embed`](https://docs.ollama.com/api/embed) with `input` and `truncate` (not the deprecated `/api/embeddings` + `prompt` path). Older Ollama builds that only expose `/api/embeddings` are tried if `/api/embed` returns 404.
 
 Output layout (example for `bge-m3`):
 
