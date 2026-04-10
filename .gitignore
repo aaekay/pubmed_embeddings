@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment and local config
+.env
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# Build/distribution artifacts
+build/
+dist/
+*.egg-info/
+
+# data
+data/
+AGENTS.md
+guide.md
