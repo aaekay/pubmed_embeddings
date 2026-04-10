@@ -102,19 +102,18 @@ Each fully processed input file is recorded in the `ingested_files` table (basen
 
 The extractor sets WAL mode, a large page cache, memory temp store, and `synchronous=NORMAL` by default. Larger `--batch-size` reduces commit overhead. For maximum throughput on a dedicated machine, use `--fast`.
 
-## Embeddings (Ollama or TEI + FAISS)
+## Embeddings (Ollama or local Sentence-Transformers + FAISS)
 
 Build **one FAISS index per embedding model** (different models have different vector dimensions, so indexes are not mixed). Each run uses rows from `articles` where **both** `title` and `abstract` are present; the embedded text is `title` + space + `abstract`.
 
-Set **`EMBEDDING_SOURCE`** to **`ollama`** or **`tei`** (alias **`tie`** is accepted). Ollama and [Text Embeddings Inference (TEI)](https://huggingface.co/docs/text-embeddings-inference/quick_tour) are different HTTP servers; use `OLLAMA_BASE_URL` for Ollama and `TEI_BASE_URL` for TEI.
+Set **`EMBEDDING_SOURCE`** to **`ollama`** (remote HTTP) or **`local`** (in-process [Sentence-Transformers](https://www.sbert.net/), no separate server). Legacy values **`tei`** / **`tie`** are accepted and mapped to **`local`**.
 
 | Variable | When | Purpose |
 |----------|------|---------|
-| `EMBEDDING_SOURCE` | Always | `ollama` (default) or `tei` |
+| `EMBEDDING_SOURCE` | Always | `ollama` (default) or `local` |
 | `OLLAMA_BASE_URL` | Ollama | e.g. `http://127.0.0.1:11434` |
-| `TEI_BASE_URL` | TEI | e.g. `http://127.0.0.1:8080` |
-| `TEI_BATCH_SIZE` | TEI | PMIDs per `POST /embed` (default `32`; override with `--tei-batch-size`) |
-| `EMBEDDING_MODEL` | Both | Ollama model name, or a label for output paths when using TEI (TEI serves one model per process) |
+| `LOCAL_EMBED_BATCH_SIZE` | Local | Articles per encode batch (default `32`; override with `--local-batch-size`) |
+| `EMBEDDING_MODEL` | Both | Ollama model name (`ollama pull …`), or Hugging Face model id for local |
 
 ### Ollama
 
@@ -128,15 +127,17 @@ uv run pubmed-embed --data-dir data
 
 `pubmed-embed` calls Ollama’s [`POST /api/embed`](https://docs.ollama.com/api/embed) with `input` and `truncate` (not the deprecated `/api/embeddings` + `prompt` path). Older Ollama builds that only expose `/api/embeddings` are tried if `/api/embed` returns 404.
 
-### TEI
+### Local (Sentence-Transformers)
 
-Run a TEI container or binary that serves your chosen embedding model (see the [TEI quick tour](https://huggingface.co/docs/text-embeddings-inference/quick_tour) for `docker run` examples). Set `EMBEDDING_SOURCE=tei`, `TEI_BASE_URL` to the service URL, and optionally `TEI_BATCH_SIZE` or `--tei-batch-size`. Then:
+1. Ensure dependencies are installed (`uv sync` includes `sentence-transformers` and PyTorch).
+2. Set `EMBEDDING_SOURCE=local` and `EMBEDDING_MODEL` to a Hugging Face sentence-embedding model (e.g. `sentence-transformers/all-MiniLM-L6-v2` or `BAAI/bge-small-en-v1.5`). The first run may download weights into the Hugging Face cache.
+3. Optionally tune `LOCAL_EMBED_BATCH_SIZE` or `--local-batch-size` for throughput vs memory.
 
 ```bash
 uv run pubmed-embed --data-dir data
 ```
 
-TEI requests use `POST /embed` with batched `inputs` and `truncate: true`.
+Embeddings are computed in the same Python process; vectors are L2-normalized before indexing (same as the Ollama path).
 
 Output layout (example for `bge-m3`):
 

@@ -90,7 +90,7 @@ def _sanitize_for_embed(text: str) -> str:
 
 
 def _clip_embedding_text(text: str) -> str:
-    """Sanitize and apply EMBEDDING_MAX_INPUT_CHARS when set (shared by Ollama and TEI)."""
+    """Sanitize and apply EMBEDDING_MAX_INPUT_CHARS when set (shared by Ollama and local)."""
     text = _sanitize_for_embed(text)
     env_max = (os.environ.get("EMBEDDING_MAX_INPUT_CHARS") or "").strip()
     if env_max.isdigit():
@@ -100,8 +100,8 @@ def _clip_embedding_text(text: str) -> str:
 
 def _normalize_embedding_source(raw: str) -> str:
     s = raw.strip().lower()
-    if s == "tie":
-        return "tei"
+    if s in ("tei", "tie"):
+        return "local"
     return s
 
 
@@ -205,51 +205,6 @@ def _fetch_ollama_embedding(
     raise RuntimeError(f"{prefix}Ollama embed failed after retries. Last error: {last_err}")
 
 
-def _tei_http_error_message(r: httpx.Response) -> str:
-    try:
-        data = r.json()
-        if isinstance(data, dict) and "error" in data:
-            return str(data["error"])
-    except Exception:
-        pass
-    body = (r.text or "").strip()
-    return body[:2000] if body else r.reason_phrase
-
-
-def _post_tei_embed(client: httpx.Client, inputs: list[str], *, truncate: bool) -> httpx.Response:
-    """POST /embed — https://huggingface.co/docs/text-embeddings-inference/"""
-    body: dict = {"inputs": inputs, "truncate": truncate}
-    return client.post("/embed", json=body)
-
-
-def _parse_tei_embed_response(data: object) -> list[list[float]]:
-    """TEI returns a JSON array of embedding vectors (same order as inputs)."""
-    if isinstance(data, list) and data:
-        if isinstance(data[0], (int, float)):
-            return [[float(x) for x in data]]
-        out: list[list[float]] = []
-        for row in data:
-            if not isinstance(row, list):
-                raise RuntimeError(f"Unexpected TEI /embed response (expected list of vectors): {data!r}")
-            out.append([float(x) for x in row])
-        return out
-    if isinstance(data, dict):
-        inner = data.get("embeddings")
-        if isinstance(inner, list):
-            return _parse_tei_embed_response(inner)
-    raise RuntimeError(f"Unexpected TEI /embed response: {data!r}")
-
-
-def _tei_vectors_normalized(vecs: list[list[float]]) -> np.ndarray:
-    arr = np.asarray(vecs, dtype=np.float32)
-    if arr.ndim != 2:
-        raise RuntimeError(f"TEI embeddings must be 2-D, got shape {arr.shape}")
-    if arr.size == 0:
-        raise RuntimeError("Empty TEI embedding batch")
-    faiss.normalize_L2(arr)
-    return arr
-
-
 def _eligible_articles(
     conn: sqlite3.Connection,
     limit: int | None,
@@ -272,7 +227,7 @@ def _embedded_set(state_conn: sqlite3.Connection) -> set[int]:
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Embed PubMed articles (title+abstract) via Ollama or TEI into a per-model FAISS index."
+        description="Embed PubMed articles (title+abstract) via Ollama or local Sentence-Transformers into a per-model FAISS index."
     )
     p.add_argument(
         "--db",
@@ -296,7 +251,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Embedding model id (Ollama) or output label (TEI); overrides EMBEDDING_MODEL",
+        help="Ollama model name, or Hugging Face id for Sentence-Transformers when EMBEDDING_SOURCE=local; overrides EMBEDDING_MODEL",
     )
     p.add_argument(
         "--ollama-base-url",
@@ -305,16 +260,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Ollama base URL (overrides OLLAMA_BASE_URL)",
     )
     p.add_argument(
-        "--tei-base-url",
-        type=str,
-        default=None,
-        help="Text Embeddings Inference base URL (overrides TEI_BASE_URL; used when EMBEDDING_SOURCE=tei)",
-    )
-    p.add_argument(
-        "--tei-batch-size",
+        "--local-batch-size",
         type=int,
         default=None,
-        help="PMIDs per POST /embed batch (overrides TEI_BATCH_SIZE; TEI only)",
+        help="Articles per encode batch (overrides LOCAL_EMBED_BATCH_SIZE; local only)",
     )
     p.add_argument(
         "--checkpoint-every",
@@ -345,10 +294,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("Set EMBEDDING_MODEL in .env or pass --model", file=sys.stderr)
         return 2
 
+    raw_embedding_source = (os.environ.get("EMBEDDING_SOURCE") or "ollama").strip().lower()
+    if raw_embedding_source in ("tei", "tie"):
+        tqdm.write(
+            "Note: EMBEDDING_SOURCE=tei/tie maps to local (in-process Sentence-Transformers).",
+            file=sys.stderr,
+        )
+
     source = _normalize_embedding_source(os.environ.get("EMBEDDING_SOURCE") or "ollama")
-    if source not in ("ollama", "tei"):
+    if source not in ("ollama", "local"):
         print(
-            f"EMBEDDING_SOURCE must be ollama or tei (alias: tie); got {source!r}",
+            f"EMBEDDING_SOURCE must be ollama or local (tei/tie map to local); got {source!r}",
             file=sys.stderr,
         )
         return 2
@@ -356,16 +312,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     base_url = (args.ollama_base_url or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip(
         "/"
     )
-    tei_base_url = (args.tei_base_url or os.environ.get("TEI_BASE_URL") or "http://127.0.0.1:8080").rstrip("/")
 
-    tei_bs_env = (os.environ.get("TEI_BATCH_SIZE") or "").strip()
-    tei_batch_size = args.tei_batch_size
-    if tei_batch_size is None:
-        if tei_bs_env.isdigit():
-            tei_batch_size = int(tei_bs_env)
+    lbs_env = (os.environ.get("LOCAL_EMBED_BATCH_SIZE") or "").strip()
+    local_batch_size = args.local_batch_size
+    if local_batch_size is None:
+        if lbs_env.isdigit():
+            local_batch_size = int(lbs_env)
         else:
-            tei_batch_size = 32
-    tei_batch_size = max(1, tei_batch_size)
+            local_batch_size = 32
+    local_batch_size = max(1, local_batch_size)
 
     ck_env = os.environ.get("EMBEDDING_CHECKPOINT_EVERY")
     checkpoint_every = args.checkpoint_every
@@ -484,14 +439,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             if len(since_ck) >= checkpoint_every:
                 checkpoint(index)
 
-    def run_tei_loop(client: httpx.Client) -> None:
+    def run_local_loop() -> None:
         nonlocal index, processed_this_run
-        with tqdm(total=len(pending), desc=f"embed [{slug}] tei", unit="pmid") as pbar:
+        from sentence_transformers import SentenceTransformer
+
+        st_model = SentenceTransformer(model)
+        with tqdm(total=len(pending), desc=f"embed [{slug}] local", unit="pmid") as pbar:
             i = 0
             while i < len(pending):
                 if STOP_EVENT.is_set():
                     break
-                batch = pending[i : i + tei_batch_size]
+                batch = pending[i : i + local_batch_size]
                 i += len(batch)
                 pmids: list[int] = []
                 inputs: list[str] = []
@@ -504,24 +462,27 @@ def main(argv: Iterable[str] | None = None) -> int:
                     pmids.append(pmid)
                     inputs.append(text)
 
-                r = _post_tei_embed(client, inputs, truncate=True)
-                if not r.is_success:
-                    err = _tei_http_error_message(r)
-                    raise RuntimeError(f"TEI error {r.status_code}: {err}")
-
-                vecs = _parse_tei_embed_response(r.json())
-                if len(vecs) != len(batch):
+                emb = st_model.encode(
+                    inputs,
+                    batch_size=min(local_batch_size, len(inputs)),
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                arr = np.asarray(emb, dtype=np.float32)
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                if arr.shape[0] != len(batch):
                     raise RuntimeError(
-                        f"TEI returned {len(vecs)} vectors for {len(batch)} inputs"
+                        f"local model returned {arr.shape[0]} vectors for {len(batch)} inputs"
                     )
-                arr = _tei_vectors_normalized(vecs)
+                faiss.normalize_L2(arr)
                 dim = int(arr.shape[1])
 
                 if index is None:
                     index = _new_index(dim)
                 elif _index_dim(index) != dim:
                     raise RuntimeError(
-                        f"Embedding dim mismatch: index has {_index_dim(index)}, TEI returned {dim}"
+                        f"Embedding dim mismatch: index has {_index_dim(index)}, model returned {dim}"
                     )
 
                 for j, pmid in enumerate(pmids):
@@ -542,10 +503,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             if index is not None and since_ck:
                 checkpoint(index)
     else:
-        with httpx.Client(base_url=tei_base_url, timeout=timeout) as client:
-            run_tei_loop(client)
-            if index is not None and since_ck:
-                checkpoint(index)
+        run_local_loop()
+        if index is not None and since_ck:
+            checkpoint(index)
 
     stopped = STOP_EVENT.is_set()
 
