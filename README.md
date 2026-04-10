@@ -101,3 +101,43 @@ Each fully processed input file is recorded in the `ingested_files` table (basen
 ### Speed notes
 
 The extractor sets WAL mode, a large page cache, memory temp store, and `synchronous=NORMAL` by default. Larger `--batch-size` reduces commit overhead. For maximum throughput on a dedicated machine, use `--fast`.
+
+## Embeddings (Ollama + FAISS)
+
+Build **one FAISS index per embedding model** (different models have different vector dimensions, so indexes are not mixed). Each run uses rows from `articles` where **both** `title` and `abstract` are present; the embedded text is `title` + space + `abstract`.
+
+1. Copy [`.env.example`](.env.example) to `.env` and set `OLLAMA_BASE_URL`, `EMBEDDING_MODEL` (and optionally `EMBEDDING_SOURCE=ollama`).
+2. Pull the model in Ollama, e.g. `ollama pull bge-m3`.
+3. Run:
+
+```bash
+uv run pubmed-embed --data-dir data
+```
+
+Output layout (example for `bge-m3`):
+
+- `data/embeddings/bge-m3/vectors.faiss` — L2-normalized vectors in `IndexIDMap2` over `IndexFlatIP` (cosine via inner product)
+- `data/embeddings/bge-m3/state.sqlite` — `embedded_pmids` for resume; PMIDs are also reconciled from the FAISS id map on startup
+
+**Second model** (e.g. `bge-large-en-v1.5`): change `EMBEDDING_MODEL` or pass `--model bge-large-en-v1.5` so output goes under `data/embeddings/bge-large-en-v1.5/` (separate index and state).
+
+**Checkpointing:** every `--checkpoint-every` PMIDs (default `50`, or `EMBEDDING_CHECKPOINT_EVERY`), the index is written atomically (`*.tmp` then replace) and PMIDs are recorded in `state.sqlite`.
+
+**Stop and resume:** Ctrl+C sets a stop flag; after the current request, a final checkpoint runs. Re-run the same command to continue; already embedded PMIDs are skipped.
+
+**Testing:** `uv run pubmed-embed --limit 10` processes only the first 10 eligible rows.
+
+## Statistics report (charts + summary)
+
+Summarize the `articles` table: counts by year, missing title/abstract, both missing / both present, and a **histogram** of combined word counts (title + abstract, split on whitespace). Outputs go to a folder (default `data/stats_report/`): `summary.txt`, `articles_per_year.png`, `word_count_histogram.png`.
+
+```bash
+uv run pubmed-stats --data-dir data
+```
+
+- **Missing** means `NULL` or empty/whitespace-only text.
+- Word histogram uses a capped x-axis by default (99.5th percentile, at least 500 words) so long tails do not squash the chart; override with `--word-max`.
+
+```bash
+uv run pubmed-stats --word-bins 40 --word-max 2000
+```

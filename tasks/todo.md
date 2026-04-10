@@ -17,3 +17,5 @@
 - Smoke test: `uv run pubmed-extract` against local `data/*.xml.gz` produced expected row counts and sample queries.
 - Extract: default DB is `<data-dir>/pubmed.sqlite`; WAL + cache PRAGMAs; batched deletes; resume via `ingested_files` (skip completed files); `--no-resume` and `--fast` documented.
 - Extract: one transaction per file (rollback on failure); corrupt gzip/XML triggers FTP re-download by basename; default deletes local `*.xml.gz` after success (`--keep-xml` to retain).
+- Embeddings: `pubmed-embed` reads eligible `articles` rows, calls Ollama `/api/embeddings`, L2-normalizes vectors, stores per-model `IndexIDMap2`+`IndexFlatIP` in `data/embeddings/<slug>/vectors.faiss` with `state.sqlite` for resume; atomic checkpoint; SIGINT/SIGTERM with final checkpoint; `.env.example` documents Ollama settings.
+- Stats: `pubmed-stats` writes `data/stats_report/` (or `--out-dir`) with `summary.txt`, `articles_per_year.png`, `word_count_histogram.png`; matplotlib Agg backend for headless runs.
