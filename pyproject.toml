@@ -1,0 +1,13 @@
+[project]
+name = "pubmed-embeddings"
+version = "0.1.0"
+description = "PubMed baseline and update file downloader"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+pubmed-download = "pubmed_embeddings.downloader:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
