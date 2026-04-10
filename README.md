@@ -60,8 +60,18 @@ After downloading `pubmed*.xml.gz` files into `data/`, parse them into a local S
 
 **Database location:** By default the DB is created at `<data-dir>/pubmed.sqlite` (for example `data/pubmed.sqlite` when `--data-dir` is `data`). Override with `--db /path/to/file.sqlite`.
 
+**Only the SQLite database is kept by default:** after a file is successfully ingested, the local `*.xml.gz` is deleted so you are not storing the full PubMed dumps on disk. Use `--keep-xml` to retain the archives (for example if you want to re-parse without re-downloading).
+
+**Corrupt or unreadable gzip/XML:** If parsing fails in a way that usually indicates a bad archive (bad gzip, zlib error, XML parse error), the extractor re-downloads that file from NCBI FTP (`baseline` first, then `updatefiles`) using the same basename (e.g. `pubmed26n0001.xml.gz`) and retries up to `5` times. Filenames must match a real file on the FTP server (otherwise redownload fails with 404).
+
 ```bash
 uv run pubmed-extract --data-dir data
+```
+
+Keep the downloaded `.xml.gz` files after ingest:
+
+```bash
+uv run pubmed-extract --data-dir data --keep-xml
 ```
 
 Specific files only:

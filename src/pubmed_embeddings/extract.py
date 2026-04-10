@@ -6,10 +6,56 @@ import pathlib
 import re
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from typing import Iterable, Iterator
 
 from tqdm import tqdm
+
+
+BASELINE_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/baseline/"
+UPDATES_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/updatefiles/"
+DOWNLOAD_CHUNK = 1024 * 1024
+MAX_REDOWNLOAD_ATTEMPTS = 5
+
+
+def _is_likely_corrupt_source_error(exc: BaseException) -> bool:
+    """True if the failure is likely bad gzip/XML on disk (retry via FTP may help)."""
+    if isinstance(exc, (gzip.BadGzipFile, EOFError, zlib.error, ET.ParseError)):
+        return True
+    return False
+
+
+def redownload_pubmed_xml_gz(basename: str, dest: pathlib.Path) -> None:
+    """Fetch a single pubmed*.xml.gz from NCBI FTP (baseline first, then updatefiles)."""
+    urls = [BASELINE_URL + basename, UPDATES_URL + basename]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    last_err: BaseException | None = None
+
+    for url in urls:
+        try:
+            tmp.unlink(missing_ok=True)
+            with urllib.request.urlopen(url) as resp, tmp.open("wb") as out:
+                while True:
+                    chunk = resp.read(DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            tmp.replace(dest)
+            return
+        except urllib.error.HTTPError as exc:
+            last_err = exc
+            if exc.code == 404:
+                continue
+            raise
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise RuntimeError(f"Could not redownload {basename!r} from baseline or updatefiles: {last_err}")
 
 
 def _local_tag(tag: str) -> str:
@@ -249,6 +295,7 @@ def extract_file(
     batch_size: int,
     stats: dict[str, int],
 ) -> None:
+    """Parse one XML(.gz) into SQLite. One transaction per file: rollback on any error."""
     batch: list[tuple[int, str | None, str | None, int | None, str | None]] = []
     delete_batch: list[tuple[int]] = []
 
@@ -267,7 +314,6 @@ def extract_file(
             """,
             batch,
         )
-        conn.commit()
         stats["rows"] = stats.get("rows", 0) + len(batch)
         batch.clear()
 
@@ -275,32 +321,37 @@ def extract_file(
         if not delete_batch:
             return
         conn.executemany("DELETE FROM articles WHERE pmid = ?", delete_batch)
-        conn.commit()
         stats["deleted"] = stats.get("deleted", 0) + len(delete_batch)
         delete_batch.clear()
 
-    for tag, elem in _iter_pubmed_events(path):
-        if tag == "PubmedArticle":
-            row = _extract_from_pubmed_article(elem)
-            if row is not None:
-                batch.append(row)
-                if len(batch) >= batch_size:
-                    flush_rows()
-            elem.clear()
-        elif tag == "DeleteCitation":
-            pmid_el = _find_child(elem, "PMID")
-            pmid_raw = "".join(pmid_el.itertext()).strip() if pmid_el is not None else ""
-            if pmid_raw:
-                try:
-                    pmid = int(pmid_raw)
-                    delete_batch.append((pmid,))
-                    if len(delete_batch) >= batch_size:
-                        flush_deletes()
-                except ValueError:
-                    pass
-            elem.clear()
-    flush_rows()
-    flush_deletes()
+    conn.execute("BEGIN")
+    try:
+        for tag, elem in _iter_pubmed_events(path):
+            if tag == "PubmedArticle":
+                row = _extract_from_pubmed_article(elem)
+                if row is not None:
+                    batch.append(row)
+                    if len(batch) >= batch_size:
+                        flush_rows()
+                elem.clear()
+            elif tag == "DeleteCitation":
+                pmid_el = _find_child(elem, "PMID")
+                pmid_raw = "".join(pmid_el.itertext()).strip() if pmid_el is not None else ""
+                if pmid_raw:
+                    try:
+                        pmid = int(pmid_raw)
+                        delete_batch.append((pmid,))
+                        if len(delete_batch) >= batch_size:
+                            flush_deletes()
+                    except ValueError:
+                        pass
+                elem.clear()
+        flush_rows()
+        flush_deletes()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _discover_xml_gz(data_dir: pathlib.Path) -> list[pathlib.Path]:
@@ -340,6 +391,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Re-ingest every file even if a previous run finished it (same basename+size+mtime)",
     )
     parser.add_argument(
+        "--keep-xml",
+        action="store_true",
+        help="Keep local *.xml.gz files after a successful ingest (default: delete them; only SQLite is kept)",
+    )
+    parser.add_argument(
         "--files",
         nargs="*",
         type=pathlib.Path,
@@ -369,20 +425,54 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         _configure_sqlite(conn, fast=args.fast)
         _ensure_schema(conn)
-        stats: dict[str, int] = {"rows": 0, "deleted": 0, "skipped_files": 0}
+        stats: dict[str, int] = {
+            "rows": 0,
+            "deleted": 0,
+            "skipped_files": 0,
+            "redownloads": 0,
+            "removed_xml": 0,
+        }
 
         for xml_path in tqdm(paths, desc="files", unit="file"):
             fp = _file_fingerprint(xml_path)
             if not args.no_resume and _is_file_already_ingested(conn, fp):
-                stats["skipped_files"] = stats.get("skipped_files", 0) + 1
+                stats["skipped_files"] += 1
                 continue
-            extract_file(xml_path, conn, batch_size=max(1, args.batch_size), stats=stats)
+
+            for attempt in range(MAX_REDOWNLOAD_ATTEMPTS):
+                try:
+                    extract_file(
+                        xml_path,
+                        conn,
+                        batch_size=max(1, args.batch_size),
+                        stats=stats,
+                    )
+                    break
+                except Exception as exc:
+                    if not _is_likely_corrupt_source_error(exc) or attempt >= MAX_REDOWNLOAD_ATTEMPTS - 1:
+                        raise
+                    tqdm.write(
+                        f"[{xml_path.name}] unreadable ({type(exc).__name__}: {exc}); "
+                        f"redownloading from NCBI (attempt {attempt + 1}/{MAX_REDOWNLOAD_ATTEMPTS})..."
+                    )
+                    redownload_pubmed_xml_gz(xml_path.name, xml_path)
+                    stats["redownloads"] += 1
+
+            fp = _file_fingerprint(xml_path)
             _mark_file_ingested(conn, fp)
+            if not args.keep_xml:
+                try:
+                    xml_path.unlink()
+                    stats["removed_xml"] += 1
+                except OSError as exc:
+                    tqdm.write(f"[{xml_path.name}] could not delete local file: {exc}")
 
         print(
             f"Done. Upserted rows (cumulative commits): {stats.get('rows', 0)}; "
             f"deletes from update files: {stats.get('deleted', 0)}; "
-            f"files skipped (resume): {stats.get('skipped_files', 0)}. "
+            f"files skipped (resume): {stats.get('skipped_files', 0)}; "
+            f"FTP redownloads (corrupt/unreadable): {stats.get('redownloads', 0)}; "
+            f"local XML removed after ingest: {stats.get('removed_xml', 0)}. "
             f"Database: {db_path}"
         )
     finally:

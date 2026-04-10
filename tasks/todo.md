@@ -16,3 +16,4 @@
 - Added `pubmed-extract` CLI: streams PubMed XML(.gz), writes PMID/title/abstract/year/journal to SQLite with batched commits; handles `DeleteCitation` in update files.
 - Smoke test: `uv run pubmed-extract` against local `data/*.xml.gz` produced expected row counts and sample queries.
 - Extract: default DB is `<data-dir>/pubmed.sqlite`; WAL + cache PRAGMAs; batched deletes; resume via `ingested_files` (skip completed files); `--no-resume` and `--fast` documented.
+- Extract: one transaction per file (rollback on failure); corrupt gzip/XML triggers FTP re-download by basename; default deletes local `*.xml.gz` after success (`--keep-xml` to retain).
