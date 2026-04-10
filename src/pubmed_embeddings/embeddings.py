@@ -83,6 +83,39 @@ def _build_prompt(title: str, abstract: str) -> str:
     return f"{title.strip()} {abstract.strip()}"
 
 
+def _sanitize_for_embed(text: str) -> str:
+    """Remove NULs and invalid UTF-8 sequences that can cause Ollama to reject the request."""
+    text = text.replace("\x00", "")
+    return text.encode("utf-8", errors="replace").decode("utf-8").strip()
+
+
+def _clip_embedding_text(text: str) -> str:
+    """Sanitize and apply EMBEDDING_MAX_INPUT_CHARS when set (shared by Ollama and TEI)."""
+    text = _sanitize_for_embed(text)
+    env_max = (os.environ.get("EMBEDDING_MAX_INPUT_CHARS") or "").strip()
+    if env_max.isdigit():
+        text = text[: int(env_max)]
+    return text
+
+
+def _normalize_embedding_source(raw: str) -> str:
+    s = raw.strip().lower()
+    if s == "tie":
+        return "tei"
+    return s
+
+
+def _ollama_http_error_message(r: httpx.Response) -> str:
+    try:
+        data = r.json()
+        if isinstance(data, dict) and "error" in data:
+            return str(data["error"])
+    except Exception:
+        pass
+    body = (r.text or "").strip()
+    return body[:2000] if body else r.reason_phrase
+
+
 def _parse_embedding_vector(data: dict) -> list[float]:
     """Ollama current API returns `embeddings` (batch); legacy returned `embedding`."""
     if "embeddings" in data:
@@ -99,25 +132,120 @@ def _parse_embedding_vector(data: dict) -> list[float]:
     raise RuntimeError(f"Unexpected Ollama response (no embeddings): {data!r}")
 
 
-def _fetch_ollama_embedding(
-    client: httpx.Client,
-    model: str,
-    text: str,
-) -> np.ndarray:
-    # Current Ollama: POST /api/embed with {"model", "input"} — see https://docs.ollama.com/api/embed
-    r = client.post(
-        "/api/embed",
-        json={"model": model, "input": text, "truncate": True},
-    )
+def _post_embed_modern(client: httpx.Client, model: str, chunk: str, truncate: bool | None) -> httpx.Response:
+    """POST /api/embed — https://docs.ollama.com/api/embed"""
+    body: dict = {"model": model, "input": chunk}
+    if truncate is not None:
+        body["truncate"] = truncate
+    return client.post("/api/embed", json=body)
+
+
+def _post_embed_legacy(client: httpx.Client, model: str, chunk: str) -> httpx.Response:
+    return client.post("/api/embeddings", json={"model": model, "prompt": chunk})
+
+
+def _request_embed_any(client: httpx.Client, model: str, chunk: str, truncate: bool | None) -> httpx.Response:
+    """Try /api/embed; on 404 only, try legacy /api/embeddings."""
+    r = _post_embed_modern(client, model, chunk, truncate)
     if r.status_code == 404:
-        # Older Ollama builds used /api/embeddings with "prompt"
-        r = client.post("/api/embeddings", json={"model": model, "prompt": text})
-    r.raise_for_status()
+        r = _post_embed_legacy(client, model, chunk)
+    return r
+
+
+def _response_to_vector(r: httpx.Response) -> np.ndarray:
     data = r.json()
     emb = _parse_embedding_vector(data)
     arr = np.asarray(emb, dtype=np.float32).reshape(1, -1)
     if arr.size == 0:
         raise RuntimeError("Empty embedding from Ollama")
+    faiss.normalize_L2(arr)
+    return arr
+
+
+def _fetch_ollama_embedding(
+    client: httpx.Client,
+    model: str,
+    text: str,
+    *,
+    pmid: int | None = None,
+) -> np.ndarray:
+    """Call Ollama embed API; retry on 400 with alternate truncate and shorter text."""
+    text = _clip_embedding_text(text)
+    if not text:
+        raise RuntimeError("Empty embedding input after sanitization")
+
+    candidates: list[str] = [text]
+    seen = {text}
+    for lim in (262144, 131072, 65536, 32768, 16384, 8192, 4096):
+        if len(text) > lim:
+            c = text[:lim]
+            if c not in seen:
+                seen.add(c)
+                candidates.append(c)
+
+    truncate_tries: list[bool | None] = [True, None, False]
+
+    prefix = f"[pmid {pmid}] " if pmid is not None else ""
+    last_err = ""
+
+    for ci, chunk in enumerate(candidates):
+        if ci > 0:
+            tqdm.write(f"{prefix}retrying with shorter input ({len(chunk)} chars) after 400")
+
+        for trunc in truncate_tries:
+            r = _request_embed_any(client, model, chunk, trunc)
+            if r.is_success:
+                return _response_to_vector(r)
+
+            last_err = _ollama_http_error_message(r)
+            if r.status_code == 400:
+                continue
+            raise RuntimeError(f"{prefix}Ollama error {r.status_code}: {last_err}")
+
+    raise RuntimeError(f"{prefix}Ollama embed failed after retries. Last error: {last_err}")
+
+
+def _tei_http_error_message(r: httpx.Response) -> str:
+    try:
+        data = r.json()
+        if isinstance(data, dict) and "error" in data:
+            return str(data["error"])
+    except Exception:
+        pass
+    body = (r.text or "").strip()
+    return body[:2000] if body else r.reason_phrase
+
+
+def _post_tei_embed(client: httpx.Client, inputs: list[str], *, truncate: bool) -> httpx.Response:
+    """POST /embed — https://huggingface.co/docs/text-embeddings-inference/"""
+    body: dict = {"inputs": inputs, "truncate": truncate}
+    return client.post("/embed", json=body)
+
+
+def _parse_tei_embed_response(data: object) -> list[list[float]]:
+    """TEI returns a JSON array of embedding vectors (same order as inputs)."""
+    if isinstance(data, list) and data:
+        if isinstance(data[0], (int, float)):
+            return [[float(x) for x in data]]
+        out: list[list[float]] = []
+        for row in data:
+            if not isinstance(row, list):
+                raise RuntimeError(f"Unexpected TEI /embed response (expected list of vectors): {data!r}")
+            out.append([float(x) for x in row])
+        return out
+    if isinstance(data, dict):
+        inner = data.get("embeddings")
+        if isinstance(inner, list):
+            return _parse_tei_embed_response(inner)
+    raise RuntimeError(f"Unexpected TEI /embed response: {data!r}")
+
+
+def _tei_vectors_normalized(vecs: list[list[float]]) -> np.ndarray:
+    arr = np.asarray(vecs, dtype=np.float32)
+    if arr.ndim != 2:
+        raise RuntimeError(f"TEI embeddings must be 2-D, got shape {arr.shape}")
+    if arr.size == 0:
+        raise RuntimeError("Empty TEI embedding batch")
     faiss.normalize_L2(arr)
     return arr
 
@@ -144,7 +272,7 @@ def _embedded_set(state_conn: sqlite3.Connection) -> set[int]:
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Embed PubMed articles (title+abstract) via Ollama into a per-model FAISS index."
+        description="Embed PubMed articles (title+abstract) via Ollama or TEI into a per-model FAISS index."
     )
     p.add_argument(
         "--db",
@@ -168,13 +296,25 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Ollama embedding model name (overrides EMBEDDING_MODEL)",
+        help="Embedding model id (Ollama) or output label (TEI); overrides EMBEDDING_MODEL",
     )
     p.add_argument(
         "--ollama-base-url",
         type=str,
         default=None,
         help="Ollama base URL (overrides OLLAMA_BASE_URL)",
+    )
+    p.add_argument(
+        "--tei-base-url",
+        type=str,
+        default=None,
+        help="Text Embeddings Inference base URL (overrides TEI_BASE_URL; used when EMBEDDING_SOURCE=tei)",
+    )
+    p.add_argument(
+        "--tei-batch-size",
+        type=int,
+        default=None,
+        help="PMIDs per POST /embed batch (overrides TEI_BATCH_SIZE; TEI only)",
     )
     p.add_argument(
         "--checkpoint-every",
@@ -205,12 +345,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("Set EMBEDDING_MODEL in .env or pass --model", file=sys.stderr)
         return 2
 
-    source = (os.environ.get("EMBEDDING_SOURCE") or "ollama").strip().lower()
-    if source != "ollama":
-        print(f"Only EMBEDDING_SOURCE=ollama is supported (got {source!r})", file=sys.stderr)
+    source = _normalize_embedding_source(os.environ.get("EMBEDDING_SOURCE") or "ollama")
+    if source not in ("ollama", "tei"):
+        print(
+            f"EMBEDDING_SOURCE must be ollama or tei (alias: tie); got {source!r}",
+            file=sys.stderr,
+        )
         return 2
 
-    base_url = (args.ollama_base_url or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    base_url = (args.ollama_base_url or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip(
+        "/"
+    )
+    tei_base_url = (args.tei_base_url or os.environ.get("TEI_BASE_URL") or "http://127.0.0.1:8080").rstrip("/")
+
+    tei_bs_env = (os.environ.get("TEI_BATCH_SIZE") or "").strip()
+    tei_batch_size = args.tei_batch_size
+    if tei_batch_size is None:
+        if tei_bs_env.isdigit():
+            tei_batch_size = int(tei_bs_env)
+        else:
+            tei_batch_size = 32
+    tei_batch_size = max(1, tei_batch_size)
 
     ck_env = os.environ.get("EMBEDDING_CHECKPOINT_EVERY")
     checkpoint_every = args.checkpoint_every
@@ -257,6 +412,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("dim", str(_index_dim(index))),
         )
+        state_conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            ("embedding_source", source),
+        )
         state_conn.commit()
 
     pending = [(p, t, a) for p, t, a in eligible if p not in embedded]
@@ -286,18 +445,24 @@ def main(argv: Iterable[str] | None = None) -> int:
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("dim", str(_index_dim(index_obj))),
         )
+        state_conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            ("embedding_source", source),
+        )
         state_conn.commit()
         since_ck.clear()
 
     timeout = httpx.Timeout(600.0)
-    with httpx.Client(base_url=base_url, timeout=timeout) as client:
+
+    def run_ollama_loop(client: httpx.Client) -> None:
+        nonlocal index, processed_this_run
         pbar = tqdm(pending, desc=f"embed [{slug}]", unit="pmid")
         for pmid, title, abstract in pbar:
             if STOP_EVENT.is_set():
                 break
             prompt = _build_prompt(title, abstract)
             try:
-                vec = _fetch_ollama_embedding(client, model, prompt)
+                vec = _fetch_ollama_embedding(client, model, prompt, pmid=pmid)
             except Exception as exc:
                 tqdm.write(f"[pmid {pmid}] Ollama error: {exc}")
                 raise
@@ -319,8 +484,68 @@ def main(argv: Iterable[str] | None = None) -> int:
             if len(since_ck) >= checkpoint_every:
                 checkpoint(index)
 
-        if index is not None and since_ck:
-            checkpoint(index)
+    def run_tei_loop(client: httpx.Client) -> None:
+        nonlocal index, processed_this_run
+        with tqdm(total=len(pending), desc=f"embed [{slug}] tei", unit="pmid") as pbar:
+            i = 0
+            while i < len(pending):
+                if STOP_EVENT.is_set():
+                    break
+                batch = pending[i : i + tei_batch_size]
+                i += len(batch)
+                pmids: list[int] = []
+                inputs: list[str] = []
+                for pmid, title, abstract in batch:
+                    text = _clip_embedding_text(_build_prompt(title, abstract))
+                    if not text:
+                        raise RuntimeError(
+                            f"Empty embedding input after sanitization [pmid {pmid}]"
+                        )
+                    pmids.append(pmid)
+                    inputs.append(text)
+
+                r = _post_tei_embed(client, inputs, truncate=True)
+                if not r.is_success:
+                    err = _tei_http_error_message(r)
+                    raise RuntimeError(f"TEI error {r.status_code}: {err}")
+
+                vecs = _parse_tei_embed_response(r.json())
+                if len(vecs) != len(batch):
+                    raise RuntimeError(
+                        f"TEI returned {len(vecs)} vectors for {len(batch)} inputs"
+                    )
+                arr = _tei_vectors_normalized(vecs)
+                dim = int(arr.shape[1])
+
+                if index is None:
+                    index = _new_index(dim)
+                elif _index_dim(index) != dim:
+                    raise RuntimeError(
+                        f"Embedding dim mismatch: index has {_index_dim(index)}, TEI returned {dim}"
+                    )
+
+                for j, pmid in enumerate(pmids):
+                    row = arr[j : j + 1]
+                    ids = np.array([pmid], dtype=np.int64)
+                    index.add_with_ids(row, ids)
+                    since_ck.append(pmid)
+                    processed_this_run += 1
+
+                pbar.update(len(batch))
+
+                if index is not None and len(since_ck) >= checkpoint_every:
+                    checkpoint(index)
+
+    if source == "ollama":
+        with httpx.Client(base_url=base_url, timeout=timeout) as client:
+            run_ollama_loop(client)
+            if index is not None and since_ck:
+                checkpoint(index)
+    else:
+        with httpx.Client(base_url=tei_base_url, timeout=timeout) as client:
+            run_tei_loop(client)
+            if index is not None and since_ck:
+                checkpoint(index)
 
     stopped = STOP_EVENT.is_set()
 

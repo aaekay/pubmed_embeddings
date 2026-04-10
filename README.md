@@ -102,11 +102,23 @@ Each fully processed input file is recorded in the `ingested_files` table (basen
 
 The extractor sets WAL mode, a large page cache, memory temp store, and `synchronous=NORMAL` by default. Larger `--batch-size` reduces commit overhead. For maximum throughput on a dedicated machine, use `--fast`.
 
-## Embeddings (Ollama + FAISS)
+## Embeddings (Ollama or TEI + FAISS)
 
 Build **one FAISS index per embedding model** (different models have different vector dimensions, so indexes are not mixed). Each run uses rows from `articles` where **both** `title` and `abstract` are present; the embedded text is `title` + space + `abstract`.
 
-1. Copy [`.env.example`](.env.example) to `.env` and set `OLLAMA_BASE_URL`, `EMBEDDING_MODEL` (and optionally `EMBEDDING_SOURCE=ollama`).
+Set **`EMBEDDING_SOURCE`** to **`ollama`** or **`tei`** (alias **`tie`** is accepted). Ollama and [Text Embeddings Inference (TEI)](https://huggingface.co/docs/text-embeddings-inference/quick_tour) are different HTTP servers; use `OLLAMA_BASE_URL` for Ollama and `TEI_BASE_URL` for TEI.
+
+| Variable | When | Purpose |
+|----------|------|---------|
+| `EMBEDDING_SOURCE` | Always | `ollama` (default) or `tei` |
+| `OLLAMA_BASE_URL` | Ollama | e.g. `http://127.0.0.1:11434` |
+| `TEI_BASE_URL` | TEI | e.g. `http://127.0.0.1:8080` |
+| `TEI_BATCH_SIZE` | TEI | PMIDs per `POST /embed` (default `32`; override with `--tei-batch-size`) |
+| `EMBEDDING_MODEL` | Both | Ollama model name, or a label for output paths when using TEI (TEI serves one model per process) |
+
+### Ollama
+
+1. Copy [`.env.example`](.env.example) to `.env` and set `OLLAMA_BASE_URL`, `EMBEDDING_MODEL`, and `EMBEDDING_SOURCE=ollama`.
 2. Pull the model in Ollama, e.g. `ollama pull bge-m3` or `ollama pull bge-large-en-v1.5`.
 3. Run:
 
@@ -115,6 +127,16 @@ uv run pubmed-embed --data-dir data
 ```
 
 `pubmed-embed` calls Ollama’s [`POST /api/embed`](https://docs.ollama.com/api/embed) with `input` and `truncate` (not the deprecated `/api/embeddings` + `prompt` path). Older Ollama builds that only expose `/api/embeddings` are tried if `/api/embed` returns 404.
+
+### TEI
+
+Run a TEI container or binary that serves your chosen embedding model (see the [TEI quick tour](https://huggingface.co/docs/text-embeddings-inference/quick_tour) for `docker run` examples). Set `EMBEDDING_SOURCE=tei`, `TEI_BASE_URL` to the service URL, and optionally `TEI_BATCH_SIZE` or `--tei-batch-size`. Then:
+
+```bash
+uv run pubmed-embed --data-dir data
+```
+
+TEI requests use `POST /embed` with batched `inputs` and `truncate: true`.
 
 Output layout (example for `bge-m3`):
 
