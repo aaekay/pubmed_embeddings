@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import pathlib
 import re
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
+import time
 from typing import Iterable
 
 import faiss
@@ -27,6 +30,82 @@ def _handle_stop_signal(_signum: int, _frame: object | None) -> None:
 def _slugify_model(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9._-]+", "-", name.strip()).strip("-")
     return s.lower() or "model"
+
+
+def _resolve_local_sentence_transformer_model(name: str) -> str:
+    """Map shorthand or wrong-org ids to valid Hugging Face repo ids for SentenceTransformer."""
+    key = name.strip()
+    if not key:
+        return key
+    aliases = {
+        "bge-large-en-v1.5": "BAAI/bge-large-en-v1.5",
+        "sentence-transformers/bge-large-en-v1.5": "BAAI/bge-large-en-v1.5",
+    }
+    return aliases.get(key, aliases.get(key.lower(), key))
+
+
+def _resolve_local_embed_device(cli_override: str | None) -> str:
+    """Pick torch device for local SentenceTransformer: cuda, cpu, or mps."""
+    import torch
+
+    raw = (cli_override or os.environ.get("LOCAL_EMBED_DEVICE") or "auto").strip().lower()
+    if raw in ("", "auto"):
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if raw == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "LOCAL_EMBED_DEVICE=cuda (or --local-device cuda) but CUDA is not available. "
+                "Use a PyTorch build that matches your NVIDIA driver, update the driver, "
+                "or set LOCAL_EMBED_DEVICE=cpu."
+            )
+        return "cuda"
+    if raw == "cpu":
+        return "cpu"
+    if raw == "mps":
+        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "LOCAL_EMBED_DEVICE=mps but MPS is not available (requires macOS Apple Silicon)."
+            )
+        return "mps"
+    raise ValueError(
+        "LOCAL_EMBED_DEVICE / --local-device must be auto, cuda, cpu, or mps; "
+        f"got {raw!r}"
+    )
+
+
+def _resolve_local_batch_size(cli_override: int | None) -> tuple[int, str]:
+    """Batch size for local encode: CLI > LOCAL_EMBED_BATCH_SIZE > TEI_BATCH_SIZE > default 32."""
+    if cli_override is not None:
+        return max(1, cli_override), "--local-batch-size"
+    lbs = (os.environ.get("LOCAL_EMBED_BATCH_SIZE") or "").strip()
+    if lbs.isdigit():
+        return max(1, int(lbs)), "LOCAL_EMBED_BATCH_SIZE"
+    tei = (os.environ.get("TEI_BATCH_SIZE") or "").strip()
+    if tei.isdigit():
+        return max(1, int(tei)), "TEI_BATCH_SIZE"
+    return 32, "default (32)"
+
+
+def _announce_local_embed_device(cli_override: str | None) -> str:
+    """Resolve device and print which accelerator local embeddings will use (stderr)."""
+    import torch
+
+    embed_device = _resolve_local_embed_device(cli_override)
+    tqdm.write(f"Local embeddings device: {embed_device}", file=sys.stderr)
+    if embed_device == "cuda" and torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        name0 = torch.cuda.get_device_name(0)
+        if n > 1:
+            tqdm.write(f"  GPU (default cuda:0 of {n}): {name0}", file=sys.stderr)
+        else:
+            tqdm.write(f"  GPU: {name0}", file=sys.stderr)
+    elif embed_device == "mps":
+        tqdm.write("  Apple Silicon GPU (MPS)", file=sys.stderr)
+    return embed_device
 
 
 def _connect_state(path: pathlib.Path) -> sqlite3.Connection:
@@ -103,6 +182,85 @@ def _normalize_embedding_source(raw: str) -> str:
     if s in ("tei", "tie"):
         return "local"
     return s
+
+
+def _parse_tei_http_base_urls() -> list[str]:
+    """Comma-separated TEI_BASE_URLS, or single TEI_BASE_URL (no trailing slash)."""
+    raw = (os.environ.get("TEI_BASE_URLS") or "").strip()
+    if raw:
+        return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+    one = (os.environ.get("TEI_BASE_URL") or "").strip()
+    if one:
+        return [one.rstrip("/")]
+    return []
+
+
+def _tei_http_embed_path() -> str:
+    p = (os.environ.get("TEI_EMBED_PATH") or "/embed").strip()
+    return p if p.startswith("/") else f"/{p}"
+
+
+def _tei_http_headers() -> dict[str, str]:
+    h: dict[str, str] = {"Content-Type": "application/json"}
+    tok = (os.environ.get("TEI_API_KEY") or os.environ.get("HF_TOKEN") or "").strip()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def _tei_response_to_matrix(data: object, *, expected_rows: int) -> np.ndarray:
+    """Parse TEI /embed JSON into float32 (expected_rows, dim); L2-normalize after."""
+    if isinstance(data, dict):
+        if "embeddings" in data and isinstance(data["embeddings"], list):
+            data = data["embeddings"]
+        else:
+            raise RuntimeError(f"Unexpected TEI JSON object (expected list or embeddings key): {data!r}")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"Unexpected TEI response (empty or not a list): {data!r}")
+    first = data[0]
+    if isinstance(first, (int, float)):
+        if expected_rows != 1:
+            raise RuntimeError(
+                f"TEI returned one flat vector but batch size was {expected_rows}"
+            )
+        arr = np.asarray(data, dtype=np.float32).reshape(1, -1)
+    else:
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim != 2:
+            raise RuntimeError(f"Unexpected TEI embedding shape: {arr.shape}")
+        if arr.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"TEI returned {arr.shape[0]} rows, expected {expected_rows}"
+            )
+    if arr.size == 0:
+        raise RuntimeError("Empty embedding matrix from TEI")
+    faiss.normalize_L2(arr)
+    return arr
+
+
+def _tei_truncate_default() -> bool:
+    v = (os.environ.get("TEI_TRUNCATE") or "true").strip().lower()
+    return v not in ("0", "false", "no")
+
+
+def _post_tei_embed(
+    client: httpx.Client,
+    base_url: str,
+    inputs: list[str],
+    *,
+    truncate: bool | None = None,
+) -> np.ndarray:
+    """POST TEI /embed; returns L2-normalized float32 matrix (len(inputs), dim)."""
+    if truncate is None:
+        truncate = _tei_truncate_default()
+    path = _tei_http_embed_path()
+    url = f"{base_url.rstrip('/')}{path}"
+    body: dict = {"inputs": inputs, "truncate": truncate}
+    r = client.post(url, json=body)
+    if not r.is_success:
+        snippet = (r.text or "")[:2000]
+        raise RuntimeError(f"TEI HTTP {r.status_code} at {url}: {snippet}")
+    return _tei_response_to_matrix(r.json(), expected_rows=len(inputs))
 
 
 def _ollama_http_error_message(r: httpx.Response) -> str:
@@ -225,9 +383,285 @@ def _embedded_set(state_conn: sqlite3.Connection) -> set[int]:
     return {int(r[0]) for r in state_conn.execute("SELECT pmid FROM embedded_pmids")}
 
 
+def _parse_gpu_ids(raw: str | None, workers: int) -> list[int]:
+    if raw is None or not str(raw).strip():
+        return list(range(workers))
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    ids = [int(p) for p in parts]
+    if len(ids) != workers:
+        raise ValueError(
+            f"--gpu-ids must list exactly {workers} device id(s), got {len(ids)}: {raw!r}"
+        )
+    return ids
+
+
+def _merge_embedding_shards(out_dir: pathlib.Path, model: str, source: str) -> int:
+    """Merge out_dir/shards/*/vectors.faiss into out_dir/vectors.faiss and union state DBs."""
+    shards_root = out_dir / "shards"
+    if not shards_root.is_dir():
+        print(f"No shards directory: {shards_root}", file=sys.stderr)
+        return 1
+
+    shard_dirs: list[tuple[int, pathlib.Path]] = []
+    for p in sorted(shards_root.iterdir()):
+        if not p.is_dir():
+            continue
+        try:
+            sid = int(p.name)
+        except ValueError:
+            continue
+        vf = p / "vectors.faiss"
+        if vf.exists() and vf.stat().st_size > 0:
+            shard_dirs.append((sid, p.resolve()))
+
+    if not shard_dirs:
+        print(f"No non-empty shard indices under {shards_root}", file=sys.stderr)
+        return 1
+
+    shard_dirs.sort(key=lambda x: x[0])
+    # Use IndexIDMap as merge target; merge_from supports IDMap + IDMap2 mixes safely.
+    merged: faiss.IndexIDMap | None = None
+    dim_ref: int | None = None
+
+    for sid, shard_path in shard_dirs:
+        idx_any = faiss.read_index(str(shard_path / "vectors.faiss"))
+        idx = faiss.downcast_index(idx_any)
+        if not isinstance(idx, (faiss.IndexIDMap, faiss.IndexIDMap2)):
+            print(f"Shard {sid}: expected IndexIDMap / IndexIDMap2", file=sys.stderr)
+            return 1
+        d = _index_dim(idx)
+        if idx.ntotal == 0:
+            continue
+        if dim_ref is None:
+            dim_ref = d
+        elif d != dim_ref:
+            print(
+                f"Shard {sid}: dimension {d} != {dim_ref} from previous shards",
+                file=sys.stderr,
+            )
+            return 1
+        if merged is None:
+            merged = faiss.IndexIDMap(faiss.IndexFlatIP(d))
+        merged.merge_from(idx)
+
+    if merged is None or merged.ntotal == 0:
+        print("Nothing to merge: all shard indices are empty.", file=sys.stderr)
+        return 1
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_index(merged, out_dir / "vectors.faiss")
+
+    state_out = out_dir / "state.sqlite"
+    if state_out.exists():
+        state_out.unlink()
+    state_conn = _connect_state(state_out)
+    seen: set[int] = set()
+    for sid, shard_path in shard_dirs:
+        sp = shard_path / "state.sqlite"
+        if not sp.exists():
+            continue
+        other = sqlite3.connect(sp)
+        for (pmid,) in other.execute("SELECT pmid FROM embedded_pmids"):
+            pid = int(pmid)
+            if pid in seen:
+                print(
+                    f"Duplicate PMID {pid} in shard states (merge conflict).",
+                    file=sys.stderr,
+                )
+                other.close()
+                state_conn.close()
+                return 1
+            seen.add(pid)
+        other.close()
+
+    state_conn.executemany(
+        "INSERT OR IGNORE INTO embedded_pmids (pmid) VALUES (?)",
+        [(p,) for p in sorted(seen)],
+    )
+    state_conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("model", model),
+    )
+    state_conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("dim", str(_index_dim(merged))),
+    )
+    state_conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("embedding_source", source),
+    )
+    state_conn.commit()
+    state_conn.close()
+
+    tqdm.write(
+        f"Merged {len(shard_dirs)} shard(s) -> {out_dir / 'vectors.faiss'} "
+        f"({merged.ntotal} vectors, {len(seen)} PMIDs in state).",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _build_worker_argv(args: argparse.Namespace, shard_id: int, num_shards: int) -> list[str]:
+    """Argv for a worker subprocess (same flags, forced single-worker + shard)."""
+    parts: list[str] = []
+    if args.db is not None:
+        parts += ["--db", str(args.db)]
+    parts += ["--data-dir", str(args.data_dir)]
+    if args.out_dir is not None:
+        parts += ["--out-dir", str(args.out_dir)]
+    if args.model is not None:
+        parts += ["--model", args.model]
+    if args.ollama_base_url is not None:
+        parts += ["--ollama-base-url", args.ollama_base_url]
+    if args.local_batch_size is not None:
+        parts += ["--local-batch-size", str(args.local_batch_size)]
+    if args.local_device is not None:
+        parts += ["--local-device", args.local_device]
+    if args.checkpoint_every is not None:
+        parts += ["--checkpoint-every", str(args.checkpoint_every)]
+    if args.limit is not None:
+        parts += ["--limit", str(args.limit)]
+    parts += [
+        "--workers",
+        "1",
+        "--shard-id",
+        str(shard_id),
+        "--num-shards",
+        str(num_shards),
+    ]
+    return parts
+
+
+def _run_coordinator(
+    args: argparse.Namespace,
+    workers: int,
+    gpu_ids: list[int],
+    *,
+    source: str,
+) -> int:
+    """Spawn one embedding subprocess per shard.
+
+    For ``local``, sets ``CUDA_VISIBLE_DEVICES`` per worker. For ``tei-http``, workers
+    are CPU-only HTTP clients; TEI processes should be bound to GPUs separately.
+    """
+    if source == "local":
+        import torch
+
+        if not torch.cuda.is_available():
+            print(
+                "Multi-GPU local embedding requires CUDA (torch.cuda.is_available()).",
+                file=sys.stderr,
+            )
+            return 1
+        if workers > int(torch.cuda.device_count()):
+            print(
+                f"--workers={workers} exceeds visible CUDA devices ({torch.cuda.device_count()}).",
+                file=sys.stderr,
+            )
+            return 1
+    elif source == "tei-http":
+        urls = _parse_tei_http_base_urls()
+        if not urls:
+            print(
+                "EMBEDDING_SOURCE=tei-http with --workers > 1 requires TEI_BASE_URL or TEI_BASE_URLS.",
+                file=sys.stderr,
+            )
+            return 2
+        if workers > len(urls):
+            tqdm.write(
+                f"Note: {workers} workers but only {len(urls)} TEI base URL(s); "
+                f"shards map with modulo (same URL may serve multiple shards).",
+                file=sys.stderr,
+            )
+    else:
+        print(f"_run_coordinator: unsupported source {source!r}", file=sys.stderr)
+        return 2
+
+    children: list[subprocess.Popen] = []
+
+    def _kill_children() -> None:
+        for c in children:
+            if c.poll() is None:
+                c.terminate()
+                try:
+                    c.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    c.kill()
+
+    def _coordinator_sig(signum: int, frame: object | None) -> None:
+        _kill_children()
+        STOP_EVENT.set()
+
+    old_int = signal.signal(signal.SIGINT, _coordinator_sig)
+    old_term = None
+    if hasattr(signal, "SIGTERM"):
+        old_term = signal.signal(signal.SIGTERM, _coordinator_sig)
+
+    try:
+        exe = sys.executable
+        mod = "pubmed_embeddings.embeddings"
+        for k in range(workers):
+            env = os.environ.copy()
+            if source == "local":
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[k])
+                tqdm.write(
+                    f"Starting worker shard {k}/{workers} on GPU {gpu_ids[k]} …",
+                    file=sys.stderr,
+                )
+            else:
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+                ulist = _parse_tei_http_base_urls()
+                u = ulist[k % len(ulist)] if ulist else "?"
+                tqdm.write(
+                    f"Starting tei-http worker shard {k}/{workers} (TEI {u}) …",
+                    file=sys.stderr,
+                )
+            wargv = [exe, "-m", mod] + _build_worker_argv(args, k, workers)
+            children.append(
+                subprocess.Popen(
+                    wargv,
+                    env=env,
+                    cwd=os.getcwd(),
+                )
+            )
+        codes: list[int] = []
+        for c in children:
+            codes.append(c.wait())
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        if old_term is not None:
+            signal.signal(signal.SIGTERM, old_term)
+
+    bad = [i for i, code in enumerate(codes) if code != 0]
+    if bad:
+        tqdm.write(
+            f"Worker(s) {bad} exited with codes {[codes[i] for i in bad]}.",
+            file=sys.stderr,
+        )
+        return codes[bad[0]] if codes[bad[0]] else 1
+
+    if getattr(args, "no_auto_merge", False):
+        tqdm.write(
+            f"All workers finished. Merge with: uv run pubmed-embed --merge-shards "
+            f"--data-dir {args.data_dir} --model {args.model or os.environ.get('EMBEDDING_MODEL', '')} …",
+            file=sys.stderr,
+        )
+        return 0
+
+    model = (args.model or os.environ.get("EMBEDDING_MODEL") or "").strip()
+    slug = _slugify_model(model)
+    out_dir = (
+        args.out_dir
+        if args.out_dir is not None
+        else args.data_dir.resolve() / "embeddings" / slug
+    ).resolve()
+    source = _normalize_embedding_source(os.environ.get("EMBEDDING_SOURCE") or "ollama")
+    return _merge_embedding_shards(out_dir, model, source)
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Embed PubMed articles (title+abstract) via Ollama or local Sentence-Transformers into a per-model FAISS index."
+        description="Embed PubMed articles (title+abstract) via Ollama, local Sentence-Transformers, or TEI HTTP into a per-model FAISS index."
     )
     p.add_argument(
         "--db",
@@ -251,7 +685,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--model",
         type=str,
         default=None,
-        help="Ollama model name, or Hugging Face id for Sentence-Transformers when EMBEDDING_SOURCE=local; overrides EMBEDDING_MODEL",
+        help="Ollama model name; Hugging Face id for local ST; metadata/path slug for tei-http; overrides EMBEDDING_MODEL",
     )
     p.add_argument(
         "--ollama-base-url",
@@ -266,16 +700,56 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Articles per encode batch (overrides LOCAL_EMBED_BATCH_SIZE; local only)",
     )
     p.add_argument(
+        "--local-device",
+        type=str,
+        default=None,
+        help="Torch device for local embeddings: auto, cuda, cpu, mps (overrides LOCAL_EMBED_DEVICE)",
+    )
+    p.add_argument(
         "--checkpoint-every",
         type=int,
         default=None,
-        help="Checkpoint (write FAISS + state) every N successful PMIDs (default: env EMBEDDING_CHECKPOINT_EVERY or 50)",
+        help="Checkpoint (write FAISS + state) every N successful PMIDs (default: env EMBEDDING_CHECKPOINT_EVERY, else 5000 local / 50 Ollama)",
     )
     p.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Only process the first N eligible rows (testing)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel workers: local=one GPU-bound process per worker; tei-http=one HTTP client per worker (set TEI_BASE_URLS). Default: env EMBED_NUM_WORKERS or 1.",
+    )
+    p.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Comma-separated physical GPU ids for workers (default: 0,1,...,workers-1). Must match --workers count.",
+    )
+    p.add_argument(
+        "--shard-id",
+        type=int,
+        default=None,
+        help="Internal: embed only PMIDs with pmid %% num_shards == shard-id; output under <out>/shards/<shard-id>/",
+    )
+    p.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Internal: total shard count (used with --shard-id).",
+    )
+    p.add_argument(
+        "--merge-shards",
+        action="store_true",
+        help="Merge out-dir/shards/*/ into canonical vectors.faiss + state.sqlite (local or tei-http) and exit.",
+    )
+    p.add_argument(
+        "--no-auto-merge",
+        action="store_true",
+        help="After parallel workers finish, do not merge shards automatically.",
     )
     return p.parse_args(argv)
 
@@ -284,6 +758,36 @@ def main(argv: Iterable[str] | None = None) -> int:
     STOP_EVENT.clear()
     load_dotenv()
     args = parse_args(argv)
+
+    workers = args.workers
+    if workers is None:
+        wenv = (os.environ.get("EMBED_NUM_WORKERS") or "").strip()
+        workers = int(wenv) if wenv.isdigit() else 1
+    workers = max(1, int(workers))
+
+    shard_id = args.shard_id
+    num_shards = args.num_shards
+
+    if shard_id is not None or num_shards is not None:
+        if shard_id is None or num_shards is None:
+            print("Both --shard-id and --num-shards are required together.", file=sys.stderr)
+            return 2
+        if num_shards < 1 or shard_id < 0 or shard_id >= num_shards:
+            print(
+                f"Invalid shard: --shard-id {shard_id} with --num-shards {num_shards}",
+                file=sys.stderr,
+            )
+            return 2
+        if workers > 1:
+            print(
+                "Use --workers 1 when passing --shard-id / --num-shards (coordinator sets workers).",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.merge_shards and workers > 1:
+        print("Use --merge-shards without --workers > 1 (unset EMBED_NUM_WORKERS or use --workers 1).", file=sys.stderr)
+        return 2
 
     data_dir = args.data_dir.resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -302,25 +806,64 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
 
     source = _normalize_embedding_source(os.environ.get("EMBEDDING_SOURCE") or "ollama")
-    if source not in ("ollama", "local"):
+    if source not in ("ollama", "local", "tei-http"):
         print(
-            f"EMBEDDING_SOURCE must be ollama or local (tei/tie map to local); got {source!r}",
+            f"EMBEDDING_SOURCE must be ollama, local, or tei-http (tei/tie map to local); got {source!r}",
             file=sys.stderr,
         )
         return 2
 
+    slug = _slugify_model(model)
+    base_out_dir = (args.out_dir if args.out_dir is not None else data_dir / "embeddings" / slug).resolve()
+
+    if args.merge_shards:
+        if source not in ("local", "tei-http"):
+            print(
+                "--merge-shards requires EMBEDDING_SOURCE=local (or tei/tie) or tei-http.",
+                file=sys.stderr,
+            )
+            return 2
+        return _merge_embedding_shards(base_out_dir, model, source)
+
+    if workers > 1:
+        if source not in ("local", "tei-http"):
+            print(
+                "--workers > 1 requires EMBEDDING_SOURCE=local (or tei/tie) or tei-http.",
+                file=sys.stderr,
+            )
+            return 2
+        if source == "local":
+            try:
+                gpu_ids = _parse_gpu_ids(args.gpu_ids, workers)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            return _run_coordinator(args, workers, gpu_ids, source="local")
+        return _run_coordinator(args, workers, [], source="tei-http")
+
+    local_embed_device: str | None = None
+    embed_batch_size, embed_batch_from = _resolve_local_batch_size(args.local_batch_size)
+    if source == "local":
+        local_embed_device = _announce_local_embed_device(args.local_device)
+        tqdm.write(
+            f"Local embeddings batch size: {embed_batch_size} (from {embed_batch_from})",
+            file=sys.stderr,
+        )
+    elif source == "tei-http":
+        if not _parse_tei_http_base_urls():
+            print(
+                "Set TEI_BASE_URL or TEI_BASE_URLS for EMBEDDING_SOURCE=tei-http.",
+                file=sys.stderr,
+            )
+            return 2
+        tqdm.write(
+            f"TEI HTTP batch size: {embed_batch_size} (from {embed_batch_from})",
+            file=sys.stderr,
+        )
+
     base_url = (args.ollama_base_url or os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip(
         "/"
     )
-
-    lbs_env = (os.environ.get("LOCAL_EMBED_BATCH_SIZE") or "").strip()
-    local_batch_size = args.local_batch_size
-    if local_batch_size is None:
-        if lbs_env.isdigit():
-            local_batch_size = int(lbs_env)
-        else:
-            local_batch_size = 32
-    local_batch_size = max(1, local_batch_size)
 
     ck_env = os.environ.get("EMBEDDING_CHECKPOINT_EVERY")
     checkpoint_every = args.checkpoint_every
@@ -328,11 +871,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         if ck_env:
             checkpoint_every = int(ck_env)
         else:
-            checkpoint_every = 50
+            # Local / TEI-HTTP runs rewrite the full FAISS file each checkpoint; a larger default avoids disk-bound slowdowns at scale.
+            checkpoint_every = 5000 if source in ("local", "tei-http") else 50
     checkpoint_every = max(1, checkpoint_every)
+    if source in ("local", "tei-http"):
+        tqdm.write(
+            f"Checkpoint every {checkpoint_every} PMIDs (FAISS + state); "
+            f"set EMBEDDING_CHECKPOINT_EVERY or --checkpoint-every to tune.",
+            file=sys.stderr,
+        )
 
-    slug = _slugify_model(model)
-    out_dir = (args.out_dir if args.out_dir is not None else data_dir / "embeddings" / slug).resolve()
+    if shard_id is not None:
+        assert num_shards is not None
+        out_dir = (base_out_dir / "shards" / str(shard_id)).resolve()
+    else:
+        out_dir = base_out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "vectors.faiss"
     state_path = out_dir / "state.sqlite"
@@ -349,7 +902,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     state_conn = _connect_state(state_path)
 
     eligible = _eligible_articles(articles_conn, limit=args.limit)
-    embedded = _embedded_set(state_conn)
+    embedded_shard = _embedded_set(state_conn)
+    embedded_canonical: set[int] = set()
+    if shard_id is not None:
+        cpath = base_out_dir / "state.sqlite"
+        if cpath.exists():
+            cconn = sqlite3.connect(f"file:{cpath}?mode=ro", uri=True)
+            embedded_canonical = _embedded_set(cconn)
+            cconn.close()
+    embedded = embedded_shard | embedded_canonical
 
     index: faiss.IndexIDMap2 | None = None
     if index_path.exists() and index_path.stat().st_size > 0:
@@ -358,7 +919,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         if not isinstance(index, (faiss.IndexIDMap, faiss.IndexIDMap2)):
             raise RuntimeError("Saved index must be IndexIDMap / IndexIDMap2")
         _reconcile_faiss_ids_into_state(state_conn, index)
-        embedded = _embedded_set(state_conn)
+        embedded_shard = _embedded_set(state_conn)
+        embedded = embedded_shard | embedded_canonical
         state_conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("model", model),
@@ -374,6 +936,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         state_conn.commit()
 
     pending = [(p, t, a) for p, t, a in eligible if p not in embedded]
+    if shard_id is not None and num_shards is not None:
+        pending = [(p, t, a) for p, t, a in pending if p % num_shards == shard_id]
 
     if not pending:
         print(f"Nothing to do: 0 pending PMIDs (eligible={len(eligible)}, embedded={len(embedded)}).")
@@ -381,12 +945,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         state_conn.close()
         return 0
 
+    pbar_desc = (
+        f"embed [{slug}] {source} s{shard_id}/{num_shards}"
+        if shard_id is not None
+        else f"embed [{slug}] {source}"
+    )
+
     since_ck: list[int] = []
     processed_this_run = 0
 
     def checkpoint(index_obj: faiss.IndexIDMap2 | faiss.IndexIDMap) -> None:
         if index_obj.ntotal == 0 or not since_ck:
             return
+        t0 = time.monotonic()
         _atomic_write_index(index_obj, index_path)
         state_conn.executemany(
             "INSERT OR IGNORE INTO embedded_pmids (pmid) VALUES (?)",
@@ -406,6 +977,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         state_conn.commit()
         since_ck.clear()
+        dt = time.monotonic() - t0
+        tqdm.write(
+            f"Checkpoint: ntotal={index_obj.ntotal} vectors, {dt:.2f}s (FAISS write + SQLite)",
+            file=sys.stderr,
+        )
 
     timeout = httpx.Timeout(600.0)
 
@@ -443,13 +1019,32 @@ def main(argv: Iterable[str] | None = None) -> int:
         nonlocal index, processed_this_run
         from sentence_transformers import SentenceTransformer
 
-        st_model = SentenceTransformer(model)
-        with tqdm(total=len(pending), desc=f"embed [{slug}] local", unit="pmid") as pbar:
+        assert local_embed_device is not None
+        hf_model_id = _resolve_local_sentence_transformer_model(model)
+        st_model = SentenceTransformer(hf_model_id, device=local_embed_device)
+        use_fp16 = (os.environ.get("LOCAL_EMBED_FP16") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if use_fp16 and local_embed_device == "cuda":
+            st_model.half()
+            tqdm.write(
+                "LOCAL_EMBED_FP16=1: model in fp16; vectors cast to float32 for FAISS (validate vs float32 if needed).",
+                file=sys.stderr,
+            )
+        elif use_fp16:
+            tqdm.write(
+                "LOCAL_EMBED_FP16 ignored (use with LOCAL_EMBED_DEVICE=cuda).",
+                file=sys.stderr,
+            )
+
+        with tqdm(total=len(pending), desc=pbar_desc, unit="pmid") as pbar:
             i = 0
             while i < len(pending):
                 if STOP_EVENT.is_set():
                     break
-                batch = pending[i : i + local_batch_size]
+                batch = pending[i : i + embed_batch_size]
                 i += len(batch)
                 pmids: list[int] = []
                 inputs: list[str] = []
@@ -464,7 +1059,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 emb = st_model.encode(
                     inputs,
-                    batch_size=min(local_batch_size, len(inputs)),
+                    batch_size=min(embed_batch_size, len(inputs)),
                     show_progress_bar=False,
                     convert_to_numpy=True,
                 )
@@ -485,25 +1080,86 @@ def main(argv: Iterable[str] | None = None) -> int:
                         f"Embedding dim mismatch: index has {_index_dim(index)}, model returned {dim}"
                     )
 
-                for j, pmid in enumerate(pmids):
-                    row = arr[j : j + 1]
-                    ids = np.array([pmid], dtype=np.int64)
-                    index.add_with_ids(row, ids)
-                    since_ck.append(pmid)
-                    processed_this_run += 1
+                ids_np = np.asarray(pmids, dtype=np.int64)
+                index.add_with_ids(arr, ids_np)
+                since_ck.extend(pmids)
+                processed_this_run += len(pmids)
 
                 pbar.update(len(batch))
 
                 if index is not None and len(since_ck) >= checkpoint_every:
                     checkpoint(index)
 
+    def run_tei_http_loop() -> None:
+        nonlocal index, processed_this_run
+        tei_all = _parse_tei_http_base_urls()
+        if not tei_all:
+            raise RuntimeError("tei-http requires TEI_BASE_URL or TEI_BASE_URLS")
+        if shard_id is not None and num_shards is not None:
+            base_pick = tei_all[shard_id % len(tei_all)]
+            tqdm.write(f"TEI HTTP base URL (shard): {base_pick}", file=sys.stderr)
+            url_cycle = None
+        else:
+            base_pick = None
+            url_cycle = itertools.cycle(tei_all)
+            tqdm.write(
+                f"TEI HTTP: round-robin across {len(tei_all)} base URL(s)",
+                file=sys.stderr,
+            )
+
+        headers = _tei_http_headers()
+        with httpx.Client(timeout=timeout, headers=headers) as client:
+            with tqdm(total=len(pending), desc=pbar_desc, unit="pmid") as pbar:
+                i = 0
+                while i < len(pending):
+                    if STOP_EVENT.is_set():
+                        break
+                    batch = pending[i : i + embed_batch_size]
+                    i += len(batch)
+                    pmids: list[int] = []
+                    inputs: list[str] = []
+                    for pmid, title, abstract in batch:
+                        text = _clip_embedding_text(_build_prompt(title, abstract))
+                        if not text:
+                            raise RuntimeError(
+                                f"Empty embedding input after sanitization [pmid {pmid}]"
+                            )
+                        pmids.append(pmid)
+                        inputs.append(text)
+
+                    tei_base = base_pick if base_pick is not None else next(url_cycle)
+                    arr = _post_tei_embed(client, tei_base, inputs)
+                    dim = int(arr.shape[1])
+
+                    if index is None:
+                        index = _new_index(dim)
+                    elif _index_dim(index) != dim:
+                        raise RuntimeError(
+                            f"Embedding dim mismatch: index has {_index_dim(index)}, TEI returned {dim}"
+                        )
+
+                    ids_np = np.asarray(pmids, dtype=np.int64)
+                    index.add_with_ids(arr, ids_np)
+                    since_ck.extend(pmids)
+                    processed_this_run += len(pmids)
+
+                    pbar.update(len(batch))
+
+                    if index is not None and len(since_ck) >= checkpoint_every:
+                        checkpoint(index)
+
     if source == "ollama":
         with httpx.Client(base_url=base_url, timeout=timeout) as client:
             run_ollama_loop(client)
             if index is not None and since_ck:
                 checkpoint(index)
-    else:
+    elif source == "local":
         run_local_loop()
+        if index is not None and since_ck:
+            checkpoint(index)
+    else:
+        assert source == "tei-http"
+        run_tei_http_loop()
         if index is not None and since_ck:
             checkpoint(index)
 

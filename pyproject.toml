@@ -10,6 +10,8 @@ dependencies = [
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
     "matplotlib>=3.8.0",
+    # Pin torch explicitly; CUDA wheels come from the PyTorch index below (cu128 matches typical driver CUDA 12.x).
+    "torch>=2.5.0",
     "sentence-transformers>=3.0.0",
 ]
 
@@ -17,8 +19,27 @@ dependencies = [
 pubmed-download = "pubmed_embeddings.downloader:main"
 pubmed-extract = "pubmed_embeddings.extract:main"
 pubmed-embed = "pubmed_embeddings.embeddings:main"
+pubmed-embed-benchmark = "pubmed_embeddings.benchmark_spike:main"
 pubmed-stats = "pubmed_embeddings.stats_report:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# PyTorch: use CUDA 12.8 wheels on Linux/Windows (not macOS — no CUDA builds there).
+# See https://docs.astral.sh/uv/guides/integration/pytorch/
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
