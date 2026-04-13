@@ -387,7 +387,11 @@ def _ensure_cuda_toolkit_on_path(env: dict[str, str]) -> None:
         raise RuntimeError(
             "CUDA toolkit binaries were not found. TEI local CUDA builds require nvcc on PATH "
             f"(for example under /usr/local/cuda/bin or /usr/local/cuda-12.6/bin). "
-            f"Searched: {searched}"
+            f"Searched: {searched}. "
+            "Install the NVIDIA CUDA Toolkit (so nvcc exists), e.g. on Ubuntu/Debian "
+            "`sudo apt install nvidia-cuda-toolkit`, or use https://developer.nvidia.com/cuda-downloads, "
+            "then ensure `nvcc` is on PATH or set CUDA_HOME. "
+            "Alternatively, put a compatible prebuilt `text-embeddings-router` on PATH to skip the source build."
         )
 
 
