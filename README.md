@@ -161,7 +161,7 @@ Important constraints:
 
 - target host must be Linux with NVIDIA GPUs visible to `nvidia-smi`
 - no Docker is required
-- a Rust toolchain with `cargo` must already be installed before the script can build TEI
+- if `cargo` is missing, the script bootstraps Rust in user space with the official `rustup-init` binary after checksum verification
 - the script validates any existing `text-embeddings-router` on `PATH` and ignores it if the version or CLI surface is incompatible
 - the first build may take a while because TEI is compiled from source
 

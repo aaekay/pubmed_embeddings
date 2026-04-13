@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import platform
 import re
 import shutil
 import signal
@@ -25,6 +27,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORTS = (11450, 11451, 11452)
 DEFAULT_GPU_IDS = (0, 1, 2)
 DEFAULT_TEI_VERSION = "v1.8.3"
+RUSTUP_DIST_URL = "https://static.rust-lang.org/rustup/dist/{target}/rustup-init"
 TEI_SOURCE_URL = (
     "https://github.com/huggingface/text-embeddings-inference/archive/refs/tags/{version}.tar.gz"
 )
@@ -359,6 +362,66 @@ def _download_to(url: str, dest: pathlib.Path) -> None:
         shutil.copyfileobj(response, out)
 
 
+def _detect_rustup_target() -> str:
+    if sys.platform != "linux":
+        raise RuntimeError(
+            f"Automatic Rust installation is supported only on Linux hosts; got {sys.platform!r}."
+        )
+    machine = platform.machine().lower()
+    mapping = {
+        "x86_64": "x86_64-unknown-linux-gnu",
+        "amd64": "x86_64-unknown-linux-gnu",
+        "aarch64": "aarch64-unknown-linux-gnu",
+        "arm64": "aarch64-unknown-linux-gnu",
+    }
+    target = mapping.get(machine)
+    if target is None:
+        raise RuntimeError(
+            f"Automatic Rust installation does not know the rustup target for architecture {machine!r}."
+        )
+    return target
+
+
+def _sha256_hex(path: pathlib.Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _verify_sha256(path: pathlib.Path, expected_hex: str) -> None:
+    actual = _sha256_hex(path)
+    if actual.lower() != expected_hex.strip().lower():
+        raise RuntimeError(
+            f"Checksum verification failed for {path.name}: expected {expected_hex}, got {actual}"
+        )
+
+
+def _download_rustup_init(paths: ManagedPaths) -> pathlib.Path:
+    target = _detect_rustup_target()
+    url = RUSTUP_DIST_URL.format(target=target)
+    binary_path = paths.downloads_root / f"rustup-init-{target}"
+    checksum_path = paths.downloads_root / f"rustup-init-{target}.sha256"
+    print(f"Downloading rustup-init for {target} ...", file=sys.stderr)
+    try:
+        _download_to(url, binary_path)
+        _download_to(f"{url}.sha256", checksum_path)
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not download rustup-init for {target}: {exc}") from exc
+
+    checksum_text = checksum_path.read_text(encoding="utf-8").strip()
+    expected_hex = checksum_text.split()[0] if checksum_text else ""
+    if not expected_hex:
+        raise RuntimeError(f"Could not parse checksum file {checksum_path}.")
+    _verify_sha256(binary_path, expected_hex)
+    binary_path.chmod(0o755)
+    return binary_path
+
+
 def _validate_tei_archive(archive_path: pathlib.Path, *, expected_root: str) -> None:
     required_member = f"{expected_root}/router/Cargo.toml"
     with tarfile.open(archive_path, mode="r:gz") as tf:
@@ -392,6 +455,45 @@ def _safe_extract_tar_gz(archive_path: pathlib.Path, dest_dir: pathlib.Path) -> 
         tf.extractall(dest_dir)
 
 
+def _install_managed_rustup(paths: ManagedPaths) -> Toolchain:
+    binary_path = _download_rustup_init(paths)
+    env = os.environ.copy()
+    env["CARGO_HOME"] = str(paths.cargo_home)
+    env["RUSTUP_HOME"] = str(paths.rustup_home)
+    env["RUSTUP_INIT_SKIP_PATH_CHECK"] = "yes"
+
+    cmd = [
+        str(binary_path),
+        "-y",
+        "--profile",
+        "minimal",
+        "--default-toolchain",
+        "stable",
+        "--no-modify-path",
+    ]
+    print(
+        "Installing Rust toolchain into user-space cache via verified rustup-init ...",
+        file=sys.stderr,
+    )
+    subprocess.run(cmd, env=env, check=True)
+
+    cargo = paths.cargo_home / "bin" / "cargo"
+    if not cargo.exists():
+        raise RuntimeError(
+            f"Rust installation finished without producing cargo at {cargo}."
+        )
+
+    _prepend_path(env, cargo.parent)
+    return Toolchain(
+        cargo=cargo,
+        env_overrides={
+            "CARGO_HOME": str(paths.cargo_home),
+            "RUSTUP_HOME": str(paths.rustup_home),
+            "PATH": env["PATH"],
+        },
+    )
+
+
 def _resolve_toolchain(paths: ManagedPaths) -> Toolchain:
     cargo_on_path = shutil.which("cargo")
     if cargo_on_path is not None:
@@ -412,10 +514,7 @@ def _resolve_toolchain(paths: ManagedPaths) -> Toolchain:
             },
         )
 
-    raise RuntimeError(
-        "cargo was not found on PATH. Install a Rust toolchain before running pubmed-tei-cluster. "
-        "Automatic rustup installation has been removed for safety."
-    )
+    return _install_managed_rustup(paths)
 
 
 def _load_install_meta(paths: ManagedPaths) -> dict[str, str]:

@@ -159,12 +159,28 @@ class TeiClusterTests(unittest.TestCase):
                     require_revision=False,
                 )
 
-    def test_resolve_toolchain_requires_existing_cargo(self) -> None:
+    def test_resolve_toolchain_installs_when_cargo_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tei_cluster._managed_paths(pathlib.Path(tmp))
             with mock.patch("shutil.which", return_value=None):
-                with self.assertRaises(RuntimeError):
-                    tei_cluster._resolve_toolchain(paths)
+                fake_toolchain = tei_cluster.Toolchain(
+                    cargo=pathlib.Path("/tmp/cargo"),
+                    env_overrides={"PATH": "/tmp"},
+                )
+                with mock.patch(
+                    "pubmed_embeddings.tei_cluster._install_managed_rustup",
+                    return_value=fake_toolchain,
+                ) as install:
+                    toolchain = tei_cluster._resolve_toolchain(paths)
+        self.assertEqual(toolchain, fake_toolchain)
+        install.assert_called_once()
+
+    def test_verify_sha256_rejects_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "file.bin"
+            path.write_bytes(b"content")
+            with self.assertRaises(RuntimeError):
+                tei_cluster._verify_sha256(path, "deadbeef")
 
     def test_resolve_router_binary_falls_back_when_path_binary_is_incompatible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
