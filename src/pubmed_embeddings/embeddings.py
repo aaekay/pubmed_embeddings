@@ -110,6 +110,9 @@ def _announce_local_embed_device(cli_override: str | None) -> str:
 
 def _connect_state(path: pathlib.Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS embedded_pmids (
@@ -178,10 +181,18 @@ def _clip_embedding_text(text: str) -> str:
 
 
 def _normalize_embedding_source(raw: str) -> str:
-    s = raw.strip().lower()
-    if s in ("tei", "tie"):
-        return "local"
-    return s
+    return raw.strip().lower()
+
+
+def _parse_embedding_source(raw: str) -> str:
+    source = _normalize_embedding_source(raw)
+    if source in ("tei", "tie"):
+        raise ValueError(
+            "EMBEDDING_SOURCE=tei/tie is ambiguous. "
+            "Use EMBEDDING_SOURCE=local for in-process Sentence-Transformers "
+            "or EMBEDDING_SOURCE=tei-http for TEI servers."
+        )
+    return source
 
 
 def _parse_tei_http_base_urls() -> list[str]:
@@ -363,24 +374,131 @@ def _fetch_ollama_embedding(
     raise RuntimeError(f"{prefix}Ollama embed failed after retries. Last error: {last_err}")
 
 
-def _eligible_articles(
+def _attach_state_database(
     conn: sqlite3.Connection,
+    *,
+    alias: str,
+    path: pathlib.Path,
+) -> None:
+    conn.execute(f"ATTACH DATABASE ? AS {alias}", (str(path),))
+
+
+def _prepare_pending_articles_connection(
+    db_path: pathlib.Path,
+    *,
+    state_path: pathlib.Path,
+    canonical_state_path: pathlib.Path | None,
+) -> tuple[sqlite3.Connection, bool]:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    _attach_state_database(conn, alias="shard_state", path=state_path)
+    include_canonical_state = canonical_state_path is not None and canonical_state_path.exists()
+    if include_canonical_state and canonical_state_path is not None:
+        _attach_state_database(conn, alias="canonical_state", path=canonical_state_path)
+    return conn, include_canonical_state
+
+
+def _build_pending_articles_query(
+    *,
     limit: int | None,
+    shard_id: int | None,
+    num_shards: int | None,
+    last_pmid: int | None,
+    batch_size: int | None,
+    include_canonical_state: bool,
+    count_only: bool,
+) -> tuple[str, list[int]]:
+    params: list[int] = []
+    if limit is None:
+        if count_only:
+            lines = ["SELECT COUNT(*) FROM articles e"]
+        else:
+            lines = ["SELECT e.pmid, e.title, e.abstract FROM articles e"]
+        lines.extend(
+            [
+                "WHERE e.title IS NOT NULL AND e.abstract IS NOT NULL",
+                "  AND trim(e.title) != '' AND trim(e.abstract) != ''",
+            ]
+        )
+    else:
+        lines = [
+            "WITH eligible_base AS (",
+            "    SELECT pmid, title, abstract FROM articles",
+            "    WHERE title IS NOT NULL AND abstract IS NOT NULL",
+            "      AND trim(title) != '' AND trim(abstract) != ''",
+            "    ORDER BY pmid",
+            "    LIMIT ?",
+            ")",
+        ]
+        params.append(limit)
+        if count_only:
+            lines.append("SELECT COUNT(*) FROM eligible_base e")
+        else:
+            lines.append("SELECT e.pmid, e.title, e.abstract FROM eligible_base e")
+        lines.append("WHERE 1=1")
+    if last_pmid is not None:
+        lines.append("  AND e.pmid > ?")
+        params.append(last_pmid)
+    if shard_id is not None and num_shards is not None:
+        lines.append("  AND (e.pmid % ?) = ?")
+        params.extend([num_shards, shard_id])
+    lines.append(
+        "  AND NOT EXISTS (SELECT 1 FROM shard_state.embedded_pmids s WHERE s.pmid = e.pmid)"
+    )
+    if include_canonical_state:
+        lines.append(
+            "  AND NOT EXISTS (SELECT 1 FROM canonical_state.embedded_pmids c WHERE c.pmid = e.pmid)"
+        )
+    if not count_only:
+        lines.append("ORDER BY e.pmid")
+        if batch_size is not None:
+            lines.append("LIMIT ?")
+            params.append(batch_size)
+    return "\n".join(lines), params
+
+
+def _count_pending_articles(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None,
+    shard_id: int | None,
+    num_shards: int | None,
+    include_canonical_state: bool,
+) -> int:
+    query, params = _build_pending_articles_query(
+        limit=limit,
+        shard_id=shard_id,
+        num_shards=num_shards,
+        last_pmid=None,
+        batch_size=None,
+        include_canonical_state=include_canonical_state,
+        count_only=True,
+    )
+    row = conn.execute(query, params).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _fetch_pending_article_batch(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None,
+    shard_id: int | None,
+    num_shards: int | None,
+    last_pmid: int | None,
+    batch_size: int,
+    include_canonical_state: bool,
 ) -> list[tuple[int, str, str]]:
-    q = """
-        SELECT pmid, title, abstract FROM articles
-        WHERE title IS NOT NULL AND abstract IS NOT NULL
-          AND trim(title) != '' AND trim(abstract) != ''
-        ORDER BY pmid
-    """
-    rows = list(conn.execute(q))
-    if limit is not None:
-        rows = rows[:limit]
+    query, params = _build_pending_articles_query(
+        limit=limit,
+        shard_id=shard_id,
+        num_shards=num_shards,
+        last_pmid=last_pmid,
+        batch_size=max(1, batch_size),
+        include_canonical_state=include_canonical_state,
+        count_only=False,
+    )
+    rows = conn.execute(query, params).fetchall()
     return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
-
-
-def _embedded_set(state_conn: sqlite3.Connection) -> set[int]:
-    return {int(r[0]) for r in state_conn.execute("SELECT pmid FROM embedded_pmids")}
 
 
 def _parse_gpu_ids(raw: str | None, workers: int) -> list[int]:
@@ -798,17 +916,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("Set EMBEDDING_MODEL in .env or pass --model", file=sys.stderr)
         return 2
 
-    raw_embedding_source = (os.environ.get("EMBEDDING_SOURCE") or "ollama").strip().lower()
-    if raw_embedding_source in ("tei", "tie"):
-        tqdm.write(
-            "Note: EMBEDDING_SOURCE=tei/tie maps to local (in-process Sentence-Transformers).",
-            file=sys.stderr,
-        )
-
-    source = _normalize_embedding_source(os.environ.get("EMBEDDING_SOURCE") or "ollama")
+    raw_embedding_source = os.environ.get("EMBEDDING_SOURCE") or "ollama"
+    try:
+        source = _parse_embedding_source(raw_embedding_source)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if source not in ("ollama", "local", "tei-http"):
         print(
-            f"EMBEDDING_SOURCE must be ollama, local, or tei-http (tei/tie map to local); got {source!r}",
+            f"EMBEDDING_SOURCE must be ollama, local, or tei-http; got {source!r}",
             file=sys.stderr,
         )
         return 2
@@ -819,7 +935,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.merge_shards:
         if source not in ("local", "tei-http"):
             print(
-                "--merge-shards requires EMBEDDING_SOURCE=local (or tei/tie) or tei-http.",
+                "--merge-shards requires EMBEDDING_SOURCE=local or tei-http.",
                 file=sys.stderr,
             )
             return 2
@@ -828,7 +944,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if workers > 1:
         if source not in ("local", "tei-http"):
             print(
-                "--workers > 1 requires EMBEDDING_SOURCE=local (or tei/tie) or tei-http.",
+                "--workers > 1 requires EMBEDDING_SOURCE=local or tei-http.",
                 file=sys.stderr,
             )
             return 2
@@ -898,19 +1014,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 1
 
-    articles_conn = sqlite3.connect(db_path)
     state_conn = _connect_state(state_path)
-
-    eligible = _eligible_articles(articles_conn, limit=args.limit)
-    embedded_shard = _embedded_set(state_conn)
-    embedded_canonical: set[int] = set()
-    if shard_id is not None:
-        cpath = base_out_dir / "state.sqlite"
-        if cpath.exists():
-            cconn = sqlite3.connect(f"file:{cpath}?mode=ro", uri=True)
-            embedded_canonical = _embedded_set(cconn)
-            cconn.close()
-    embedded = embedded_shard | embedded_canonical
+    canonical_state_path = (base_out_dir / "state.sqlite") if shard_id is not None else None
 
     index: faiss.IndexIDMap2 | None = None
     if index_path.exists() and index_path.stat().st_size > 0:
@@ -919,8 +1024,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         if not isinstance(index, (faiss.IndexIDMap, faiss.IndexIDMap2)):
             raise RuntimeError("Saved index must be IndexIDMap / IndexIDMap2")
         _reconcile_faiss_ids_into_state(state_conn, index)
-        embedded_shard = _embedded_set(state_conn)
-        embedded = embedded_shard | embedded_canonical
         state_conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("model", model),
@@ -935,12 +1038,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         state_conn.commit()
 
-    pending = [(p, t, a) for p, t, a in eligible if p not in embedded]
-    if shard_id is not None and num_shards is not None:
-        pending = [(p, t, a) for p, t, a in pending if p % num_shards == shard_id]
+    articles_conn, include_canonical_state = _prepare_pending_articles_connection(
+        db_path,
+        state_path=state_path,
+        canonical_state_path=canonical_state_path,
+    )
+    pending_count = _count_pending_articles(
+        articles_conn,
+        limit=args.limit,
+        shard_id=shard_id,
+        num_shards=num_shards,
+        include_canonical_state=include_canonical_state,
+    )
 
-    if not pending:
-        print(f"Nothing to do: 0 pending PMIDs (eligible={len(eligible)}, embedded={len(embedded)}).")
+    if pending_count == 0:
+        print("Nothing to do: 0 pending PMIDs.")
         articles_conn.close()
         state_conn.close()
         return 0
@@ -987,33 +1099,46 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     def run_ollama_loop(client: httpx.Client) -> None:
         nonlocal index, processed_this_run
-        pbar = tqdm(pending, desc=f"embed [{slug}]", unit="pmid")
-        for pmid, title, abstract in pbar:
-            if STOP_EVENT.is_set():
-                break
-            prompt = _build_prompt(title, abstract)
-            try:
-                vec = _fetch_ollama_embedding(client, model, prompt, pmid=pmid)
-            except Exception as exc:
-                tqdm.write(f"[pmid {pmid}] Ollama error: {exc}")
-                raise
+        last_pmid: int | None = None
+        with tqdm(total=pending_count, desc=pbar_desc, unit="pmid") as pbar:
+            while not STOP_EVENT.is_set():
+                batch = _fetch_pending_article_batch(
+                    articles_conn,
+                    limit=args.limit,
+                    shard_id=shard_id,
+                    num_shards=num_shards,
+                    last_pmid=last_pmid,
+                    batch_size=1,
+                    include_canonical_state=include_canonical_state,
+                )
+                if not batch:
+                    break
+                pmid, title, abstract = batch[0]
+                last_pmid = pmid
+                prompt = _build_prompt(title, abstract)
+                try:
+                    vec = _fetch_ollama_embedding(client, model, prompt, pmid=pmid)
+                except Exception as exc:
+                    tqdm.write(f"[pmid {pmid}] Ollama error: {exc}")
+                    raise
 
-            dim = vec.shape[1]
-            if index is None:
-                index = _new_index(dim)
-            else:
-                if _index_dim(index) != dim:
-                    raise RuntimeError(
-                        f"Embedding dim mismatch: index has {_index_dim(index)}, model returned {dim}"
-                    )
+                dim = vec.shape[1]
+                if index is None:
+                    index = _new_index(dim)
+                else:
+                    if _index_dim(index) != dim:
+                        raise RuntimeError(
+                            f"Embedding dim mismatch: index has {_index_dim(index)}, model returned {dim}"
+                        )
 
-            ids = np.array([pmid], dtype=np.int64)
-            index.add_with_ids(vec, ids)
-            since_ck.append(pmid)
-            processed_this_run += 1
+                ids = np.array([pmid], dtype=np.int64)
+                index.add_with_ids(vec, ids)
+                since_ck.append(pmid)
+                processed_this_run += 1
+                pbar.update(1)
 
-            if len(since_ck) >= checkpoint_every:
-                checkpoint(index)
+                if len(since_ck) >= checkpoint_every:
+                    checkpoint(index)
 
     def run_local_loop() -> None:
         nonlocal index, processed_this_run
@@ -1039,13 +1164,21 @@ def main(argv: Iterable[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
-        with tqdm(total=len(pending), desc=pbar_desc, unit="pmid") as pbar:
-            i = 0
-            while i < len(pending):
-                if STOP_EVENT.is_set():
+        last_pmid: int | None = None
+        with tqdm(total=pending_count, desc=pbar_desc, unit="pmid") as pbar:
+            while not STOP_EVENT.is_set():
+                batch = _fetch_pending_article_batch(
+                    articles_conn,
+                    limit=args.limit,
+                    shard_id=shard_id,
+                    num_shards=num_shards,
+                    last_pmid=last_pmid,
+                    batch_size=embed_batch_size,
+                    include_canonical_state=include_canonical_state,
+                )
+                if not batch:
                     break
-                batch = pending[i : i + embed_batch_size]
-                i += len(batch)
+                last_pmid = batch[-1][0]
                 pmids: list[int] = []
                 inputs: list[str] = []
                 for pmid, title, abstract in batch:
@@ -1109,13 +1242,21 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         headers = _tei_http_headers()
         with httpx.Client(timeout=timeout, headers=headers) as client:
-            with tqdm(total=len(pending), desc=pbar_desc, unit="pmid") as pbar:
-                i = 0
-                while i < len(pending):
-                    if STOP_EVENT.is_set():
+            last_pmid: int | None = None
+            with tqdm(total=pending_count, desc=pbar_desc, unit="pmid") as pbar:
+                while not STOP_EVENT.is_set():
+                    batch = _fetch_pending_article_batch(
+                        articles_conn,
+                        limit=args.limit,
+                        shard_id=shard_id,
+                        num_shards=num_shards,
+                        last_pmid=last_pmid,
+                        batch_size=embed_batch_size,
+                        include_canonical_state=include_canonical_state,
+                    )
+                    if not batch:
                         break
-                    batch = pending[i : i + embed_batch_size]
-                    i += len(batch)
+                    last_pmid = batch[-1][0]
                     pmids: list[int] = []
                     inputs: list[str] = []
                     for pmid, title, abstract in batch:

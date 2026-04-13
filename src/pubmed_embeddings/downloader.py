@@ -91,7 +91,7 @@ def should_download(path: pathlib.Path, remote_url: str, force: bool) -> bool:
 
     remote_size = remote_size_bytes(remote_url)
     if remote_size is None:
-        return False
+        return True
     return path.stat().st_size != remote_size
 
 
@@ -139,7 +139,13 @@ def _build_jobs(
 
         expected_size = remote_size_bytes(remote.url)
         if expected_size is None:
-            skipped += 1
+            jobs.append(
+                DownloadJob(
+                    remote=remote,
+                    target_path=target_path,
+                    expected_size=None,
+                )
+            )
             continue
 
         if target_path.stat().st_size == expected_size:

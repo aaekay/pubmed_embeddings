@@ -21,6 +21,7 @@ pubmed-extract = "pubmed_embeddings.extract:main"
 pubmed-embed = "pubmed_embeddings.embeddings:main"
 pubmed-embed-benchmark = "pubmed_embeddings.benchmark_spike:main"
 pubmed-stats = "pubmed_embeddings.stats_report:main"
+pubmed-tei-cluster = "pubmed_embeddings.tei_cluster:main"
 
 [build-system]
 requires = ["hatchling"]

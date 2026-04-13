@@ -102,11 +102,11 @@ Each fully processed input file is recorded in the `ingested_files` table (basen
 
 The extractor sets WAL mode, a large page cache, memory temp store, and `synchronous=NORMAL` by default. Larger `--batch-size` reduces commit overhead. For maximum throughput on a dedicated machine, use `--fast`.
 
-## Embeddings (Ollama or local Sentence-Transformers + FAISS)
+## Embeddings (Ollama, local Sentence-Transformers, or TEI HTTP + FAISS)
 
 Build **one FAISS index per embedding model** (different models have different vector dimensions, so indexes are not mixed). Each run uses rows from `articles` where **both** `title` and `abstract` are present; the embedded text is `title` + space + `abstract`.
 
-Set **`EMBEDDING_SOURCE`** to **`ollama`** (remote HTTP), **`local`** (in-process [Sentence-Transformers](https://www.sbert.net/), no separate server), or **`tei-http`** ([Hugging Face Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) over HTTP). Legacy values **`tei`** / **`tie`** are accepted and mapped to **`local`** (in-process ST, not HTTP).
+Set **`EMBEDDING_SOURCE`** to **`ollama`** (remote HTTP), **`local`** (in-process [Sentence-Transformers](https://www.sbert.net/), no separate server), or **`tei-http`** ([Hugging Face Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) over HTTP). Legacy values **`tei`** / **`tie`** are rejected: use **`local`** for in-process embeddings or **`tei-http`** for TEI servers.
 
 | Variable | When | Purpose |
 |----------|------|---------|
@@ -114,8 +114,8 @@ Set **`EMBEDDING_SOURCE`** to **`ollama`** (remote HTTP), **`local`** (in-proces
 | `OLLAMA_BASE_URL` | Ollama | e.g. `http://127.0.0.1:11434` |
 | `LOCAL_EMBED_BATCH_SIZE` | Local / tei-http | Articles per encode batch (default `32`; override with `--local-batch-size`) |
 | `TEI_BATCH_SIZE` | Local / tei-http | Used as batch size when `LOCAL_EMBED_BATCH_SIZE` is unset (same as legacy TEI naming in `.env`) |
-| `TEI_BASE_URL` | tei-http | Single TEI server base URL (no trailing slash), e.g. `http://127.0.0.1:8080` |
-| `TEI_BASE_URLS` | tei-http | Comma-separated list for **round-robin** (single process) or **one URL per shard** when using `--workers` (shard `k` uses `urls[k % len(urls)]`) |
+| `TEI_BASE_URL` | tei-http | Single TEI server base URL (no trailing slash), e.g. `http://127.0.0.1:11450` |
+| `TEI_BASE_URLS` | tei-http | Comma-separated list for **round-robin** (single process) or **one URL per shard** when using `--workers`; the built-in TEI cluster defaults to `http://127.0.0.1:11450,http://127.0.0.1:11451,http://127.0.0.1:11452` |
 | `TEI_EMBED_PATH` | tei-http | Embed path (default `/embed`) |
 | `TEI_API_KEY` / `HF_TOKEN` | tei-http | Optional `Authorization: Bearer` for hosted TEI |
 | `TEI_TRUNCATE` | tei-http | `true`/`false` — passed as JSON `truncate` to TEI (default true) |
@@ -138,12 +138,48 @@ uv run pubmed-embed --data-dir data
 
 ### TEI HTTP (Text Embeddings Inference)
 
-1. Run one TEI process per GPU (recommended for throughput), each bound to a GPU and listening on its own port, e.g. three containers with `CUDA_VISIBLE_DEVICES=0` / `1` / `2` and ports `8080` / `8081` / `8082`.
-2. Set `EMBEDDING_SOURCE=tei-http`, `EMBEDDING_MODEL` to match what TEI serves (for paths/metadata), and **`TEI_BASE_URLS=http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:8082`** for a **three-worker** coordinator (`--workers 3`). Each worker is a **CPU-only** HTTP client; shard `k` uses `TEI_BASE_URLS[k % n]`. Alternatively, a **single** `TEI_BASE_URL` with a reverse proxy load balancer is fine.
-3. Batching uses the same env as local: `LOCAL_EMBED_BATCH_SIZE` / `TEI_BATCH_SIZE` / `--local-batch-size`.
+Run TEI as a separate service layer, then point `pubmed-embed` at those HTTP endpoints.
+
+#### Single-script 3-GPU TEI cluster
+
+`pubmed-tei-cluster` is a foreground supervisor for a Linux NVIDIA server. It:
+
+- reuses a compatible `text-embeddings-router` on `PATH` when available, otherwise builds TEI from source into a user-space cache
+- launches one TEI worker per GPU
+- waits for health checks to pass
+- keeps all workers in the foreground and stops them together on Ctrl+C
+
+Default ports are **`11450`**, **`11451`**, and **`11452`**.
 
 ```bash
-EMBEDDING_SOURCE=tei-http TEI_BASE_URL=http://127.0.0.1:8080 uv run pubmed-embed --data-dir data
+uv run pubmed-tei-cluster --model BAAI/bge-large-en-v1.5
+```
+
+The supervisor binds GPUs `0,1,2` to ports `11450,11451,11452` by default. Override with `--gpu-ids` or `--ports` if needed.
+
+Important constraints:
+
+- target host must be Linux with NVIDIA GPUs visible to `nvidia-smi`
+- no Docker is required
+- a Rust toolchain with `cargo` must already be installed before the script can build TEI
+- the script validates any existing `text-embeddings-router` on `PATH` and ignores it if the version or CLI surface is incompatible
+- the first build may take a while because TEI is compiled from source
+
+#### Embedding client against the TEI cluster
+
+Once the TEI supervisor is healthy, run embeddings from another shell:
+
+```bash
+EMBEDDING_SOURCE=tei-http \
+TEI_BASE_URLS=http://127.0.0.1:11450,http://127.0.0.1:11451,http://127.0.0.1:11452 \
+EMBEDDING_MODEL=BAAI/bge-large-en-v1.5 \
+uv run pubmed-embed --data-dir data --workers 3
+```
+
+`pubmed-embed` remains a **CPU-only HTTP client** in `tei-http` mode; the GPU work happens inside the TEI servers. Batching uses the same env as local: `LOCAL_EMBED_BATCH_SIZE` / `TEI_BATCH_SIZE` / `--local-batch-size`.
+
+```bash
+EMBEDDING_SOURCE=tei-http TEI_BASE_URL=http://127.0.0.1:11450 uv run pubmed-embed --data-dir data
 ```
 
 **Spike / benchmark** (fully in-process — no port, no `text-embeddings-router`, no Docker, no sudo):
@@ -193,7 +229,7 @@ Use **multiple processes** to embed disjoint PMID subsets in parallel. Partition
 
 #### `EMBEDDING_SOURCE=tei-http`
 
-- **Coordinator:** same `--workers 3`, but subprocesses do **not** require CUDA in Python—each worker calls **one TEI base URL** from `TEI_BASE_URLS` (or round-robin a single URL). Run **three TEI servers** (one GPU each) and list all three URLs in `TEI_BASE_URLS`.
+- **Coordinator:** same `--workers 3`, but subprocesses do **not** require CUDA in Python—each worker calls **one TEI base URL** from `TEI_BASE_URLS` (or round-robin a single URL). The built-in supervisor uses `http://127.0.0.1:11450`, `11451`, and `11452` by default.
 
 #### Common
 

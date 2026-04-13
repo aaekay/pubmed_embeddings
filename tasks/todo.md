@@ -3,6 +3,17 @@
 - [x] Add idempotent download logic (skip unchanged files).
 - [x] Document usage and examples.
 - [x] Run basic verification and capture results.
+- [x] Add a TEI cluster supervisor CLI that can build or reuse TEI and launch one server per GPU on ports 11450-11452.
+- [x] Wire the new CLI into project packaging and align the embedding client with explicit `tei-http` usage.
+- [x] Update `.env.example` and `README.md` to document the TEI cluster workflow and separate it from local in-process embeddings.
+- [x] Add automated tests for TEI supervisor logic and embedding source validation.
+- [x] Run verification and capture results for the TEI workflow changes.
+- [x] Harden TEI supervisor binary probing, install prerequisites, archive validation, and startup cleanup.
+- [x] Refactor embedding selection/resume logic to avoid full in-memory materialization before sharding.
+- [x] Make downloader re-download when remote size cannot be confirmed instead of silently trusting local files.
+- [x] Stream stats aggregation instead of loading all article rows into memory.
+- [x] Expand tests for TEI process logic, embedding query behavior, downloader job selection, and stats output.
+- [x] Run verification and capture results for the hardening/scalability pass.
 
 ## Review
 
@@ -18,5 +29,14 @@
 - Extract: default DB is `<data-dir>/pubmed.sqlite`; WAL + cache PRAGMAs; batched deletes; resume via `ingested_files` (skip completed files); `--no-resume` and `--fast` documented.
 - Extract: one transaction per file (rollback on failure); corrupt gzip/XML triggers FTP re-download by basename; default deletes local `*.xml.gz` after success (`--keep-xml` to retain).
 - Embeddings: `pubmed-embed` reads eligible `articles` rows, calls Ollama `POST /api/embed` (`input` + `truncate`; fallback to legacy `/api/embeddings`), L2-normalizes vectors, stores per-model `IndexIDMap2`+`IndexFlatIP` in `data/embeddings/<slug>/vectors.faiss` with `state.sqlite` for resume; atomic checkpoint; SIGINT/SIGTERM with final checkpoint; `.env.example` documents Ollama settings.
-- Embeddings (local): `EMBEDDING_SOURCE=local` uses in-process Sentence-Transformers (`LOCAL_EMBED_BATCH_SIZE` / `--local-batch-size`); legacy `tei`/`tie` map to local; HTTP TEI path removed; `embedding_source` in `state.sqlite` meta; README + `.env.example` updated.
+- Embeddings (local): `EMBEDDING_SOURCE=local` uses in-process Sentence-Transformers (`LOCAL_EMBED_BATCH_SIZE` / `--local-batch-size`); `embedding_source` is stored in `state.sqlite` meta; README + `.env.example` updated.
 - Stats: `pubmed-stats` writes `data/stats_report/` (or `--out-dir`) with `summary.txt`, `articles_per_year.png`, `word_count_histogram.png`; matplotlib Agg backend for headless runs.
+- Added `pubmed-tei-cluster`: a foreground TEI supervisor that validates Linux/NVIDIA prerequisites, probes any `text-embeddings-router` found on `PATH`, reuses it only when the version/CLI surface matches the requested TEI release, otherwise falls back to a managed source build, launches one worker per GPU, waits for health checks, and prints the matching `pubmed-embed` command for TEI HTTP on ports `11450,11451,11452`.
+- Embedding source handling is now explicit: `EMBEDDING_SOURCE=tei` / `tie` is rejected with a migration error; use `local` for in-process Sentence-Transformers or `tei-http` for TEI servers.
+- Updated `.env.example` and `README.md` to document the new TEI supervisor workflow, the `tei-http` client configuration, and the fixed default ports `11450-11452`.
+- Verification: `uv run python -m py_compile src/pubmed_embeddings/*.py tests/*.py`, `.venv/bin/python -m unittest discover -s tests -q`, `uv run pubmed-tei-cluster --help`, and `uv run pubmed-embed --help`.
+- Hardening/scalability pass: removed automatic remote rustup bootstrap; `pubmed-tei-cluster` now requires an existing Rust toolchain, validates downloaded TEI archives before extract/build, and terminates already-started workers immediately if a later worker fails readiness.
+- Embeddings: pending article selection is now SQL-backed and batched, with state/canonical-state filtering done through attached SQLite databases instead of full Python lists/sets before sharding.
+- Downloader: local files are re-downloaded when remote size cannot be confirmed instead of being silently skipped as unchanged.
+- Stats: aggregation now streams rows and keeps only the numeric word-count series needed for histogram/percentile calculation.
+- Verification: `uv run python -m py_compile src/pubmed_embeddings/*.py tests/*.py`, `.venv/bin/python -m unittest discover -s tests -q`, `uv run pubmed-tei-cluster --help`, `uv run pubmed-embed --help`, `uv run pubmed-download --help`, and `uv run pubmed-stats --help`.

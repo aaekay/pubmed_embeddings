@@ -91,31 +91,37 @@ def main(argv: Iterable[str] | None = None) -> int:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        rows = list(conn.execute("SELECT pmid, title, abstract, year FROM articles"))
+        n = 0
+        title_missing = 0
+        abstract_missing = 0
+        both_missing = 0
+        both_present = 0
+        year_counts: dict[str, int] = {}
+        combined_word_values: list[int] = []
+
+        for row in conn.execute("SELECT title, abstract, year FROM articles"):
+            n += 1
+            title = row["title"]
+            abstract = row["abstract"]
+            title_is_missing = _is_missing(title)
+            abstract_is_missing = _is_missing(abstract)
+            if title_is_missing:
+                title_missing += 1
+            if abstract_is_missing:
+                abstract_missing += 1
+            if title_is_missing and abstract_is_missing:
+                both_missing += 1
+            if not title_is_missing and not abstract_is_missing:
+                both_present += 1
+
+            y = row["year"]
+            key = str(int(y)) if y is not None else "unknown"
+            year_counts[key] = year_counts.get(key, 0) + 1
+            combined_word_values.append(_combined_word_count(title, abstract))
     finally:
         conn.close()
 
-    n = len(rows)
-    title_missing = sum(1 for r in rows if _is_missing(r["title"]))
-    abstract_missing = sum(1 for r in rows if _is_missing(r["abstract"]))
-    both_missing = sum(
-        1 for r in rows if _is_missing(r["title"]) and _is_missing(r["abstract"])
-    )
-    both_present = sum(
-        1
-        for r in rows
-        if not _is_missing(r["title"]) and not _is_missing(r["abstract"])
-    )
-
-    year_counts: dict[str, int] = {}
-    for r in rows:
-        y = r["year"]
-        key = str(int(y)) if y is not None else "unknown"
-        year_counts[key] = year_counts.get(key, 0) + 1
-
-    combined_words = np.array(
-        [_combined_word_count(r["title"], r["abstract"]) for r in rows], dtype=np.float64
-    )
+    combined_words = np.asarray(combined_word_values, dtype=np.float64)
 
     lines = [
         f"Total articles: {n}",
