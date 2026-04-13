@@ -273,6 +273,45 @@ def _prepend_path(env: dict[str, str], candidate: pathlib.Path) -> None:
     env["PATH"] = prefix if not current else f"{prefix}:{current}"
 
 
+def _candidate_cuda_bin_dirs(env: dict[str, str]) -> list[pathlib.Path]:
+    candidates: list[pathlib.Path] = []
+
+    def add(path: pathlib.Path) -> None:
+        if path not in candidates:
+            candidates.append(path)
+
+    for key in ("CUDA_HOME", "CUDA_PATH"):
+        value = env.get(key)
+        if value:
+            add(pathlib.Path(value) / "bin")
+
+    current_path = env.get("PATH", "")
+    for piece in current_path.split(":"):
+        if piece:
+            add(pathlib.Path(piece))
+
+    add(pathlib.Path("/usr/local/cuda/bin"))
+    for base in sorted(pathlib.Path("/usr/local").glob("cuda-*/bin")):
+        add(base)
+
+    home = pathlib.Path.home()
+    for base in (
+        home / ".local" / "cuda" / "bin",
+        home / "cuda" / "bin",
+    ):
+        add(base)
+
+    conda_prefix = env.get("CONDA_PREFIX")
+    if conda_prefix:
+        add(pathlib.Path(conda_prefix) / "bin")
+
+    virtual_env = env.get("VIRTUAL_ENV")
+    if virtual_env:
+        add(pathlib.Path(virtual_env) / "bin")
+
+    return [path for path in candidates if path.exists()]
+
+
 def _normalize_version_token(raw: str) -> str:
     return raw.strip().lower().lstrip("v")
 
@@ -338,21 +377,17 @@ def _probe_router_binary(
 
 
 def _ensure_cuda_toolkit_on_path(env: dict[str, str]) -> None:
-    candidates: list[pathlib.Path] = []
-    for key in ("CUDA_HOME", "CUDA_PATH"):
-        value = env.get(key)
-        if value:
-            candidates.append(pathlib.Path(value) / "bin")
-    candidates.append(pathlib.Path("/usr/local/cuda/bin"))
-
+    candidates = _candidate_cuda_bin_dirs(env)
     for candidate in candidates:
         if candidate.exists():
             _prepend_path(env, candidate)
 
     if shutil.which("nvcc", path=env.get("PATH")) is None:
+        searched = ", ".join(str(path) for path in candidates) or "none"
         raise RuntimeError(
             "CUDA toolkit binaries were not found. TEI local CUDA builds require nvcc on PATH "
-            "(for example under /usr/local/cuda/bin)."
+            f"(for example under /usr/local/cuda/bin or /usr/local/cuda-12.6/bin). "
+            f"Searched: {searched}"
         )
 
 

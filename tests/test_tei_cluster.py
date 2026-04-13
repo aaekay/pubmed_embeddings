@@ -182,6 +182,22 @@ class TeiClusterTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 tei_cluster._verify_sha256(path, "deadbeef")
 
+    def test_candidate_cuda_bin_dirs_includes_versioned_usr_local_paths(self) -> None:
+        env = {"PATH": ""}
+        fake_path = pathlib.Path("/usr/local/cuda-12.6/bin")
+        original_glob = pathlib.Path.glob
+
+        def fake_glob(path_obj: pathlib.Path, pattern: str):  # type: ignore[override]
+            if path_obj == pathlib.Path("/usr/local") and pattern == "cuda-*/bin":
+                return [fake_path]
+            return list(original_glob(path_obj, pattern))
+
+        with mock.patch("pathlib.Path.glob", autospec=True, side_effect=fake_glob):
+            with mock.patch("pathlib.Path.exists", autospec=True) as exists:
+                exists.side_effect = lambda p: p == fake_path
+                candidates = tei_cluster._candidate_cuda_bin_dirs(env)
+        self.assertIn(fake_path, candidates)
+
     def test_resolve_router_binary_falls_back_when_path_binary_is_incompatible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tei_cluster._managed_paths(pathlib.Path(tmp))
