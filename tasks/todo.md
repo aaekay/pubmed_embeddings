@@ -87,3 +87,17 @@
 - `pubmed-query` now prefers HNSW when the sidecar exists and matches the canonical flat metadata, supports `--hnsw-ef-search` and `--flat-only`, falls back to flat with a warning when HNSW is stale or unusable, and reports the selected index type in text and JSON output.
 - Added `tests/test_build_hnsw.py` plus expanded `tests/test_query.py` coverage for HNSW selection, stale-sidecar fallback, flat-only behavior, and builder metadata.
 - Verification: `python -m py_compile src/pubmed_embeddings/index_utils.py src/pubmed_embeddings/build_hnsw.py src/pubmed_embeddings/query.py tests/test_build_hnsw.py tests/test_query.py`, `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_build_hnsw tests.test_query tests.test_embeddings`, `uv run pubmed-build-hnsw --help`, and `uv run pubmed-query --help`.
+
+## HNSW Builder Verbosity
+
+- [x] Make `pubmed-build-hnsw` print stage-level progress and timings in the terminal.
+- [x] Add test coverage for the more verbose builder output.
+- [x] Run targeted verification for the builder UX changes.
+
+### HNSW Builder Verbosity Review
+
+- `pubmed-build-hnsw` now prints stage-level terminal output for model/path selection, flat-index loading, vector counts/dim, HNSW graph build start/end, sidecar write start/end, metadata update start/end, and total runtime.
+- HNSW insertion now uses a tqdm progress bar (`hnsw [<model-slug>]`) so large builds show ongoing progress instead of appearing stalled.
+- The final success line still prints to stdout, but the operational progress and timings are emitted to stderr for terminal visibility.
+- Expanded `tests/test_build_hnsw.py` to assert the verbose builder output.
+- Verification: `python -m py_compile src/pubmed_embeddings/build_hnsw.py tests/test_build_hnsw.py`, `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_build_hnsw tests.test_query tests.test_embeddings`, and `uv run pubmed-build-hnsw --help`.

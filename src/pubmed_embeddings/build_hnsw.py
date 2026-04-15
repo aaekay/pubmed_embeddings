@@ -4,9 +4,12 @@ import argparse
 import os
 import pathlib
 import sys
+import time
 from typing import Iterable
 
+import faiss
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from pubmed_embeddings.embeddings import _atomic_write_index, _connect_state, _slugify_model
 from pubmed_embeddings.index_utils import (
@@ -15,11 +18,12 @@ from pubmed_embeddings.index_utils import (
     DEFAULT_HNSW_M,
     FLAT_INDEX_FILENAME,
     HNSW_INDEX_FILENAME,
-    build_hnsw_index,
     extract_flat_ids_and_vectors,
     load_index,
     upsert_state_meta,
 )
+
+DEFAULT_ADD_BATCH_SIZE = 50_000
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -72,9 +76,43 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _log(message: str) -> None:
+    tqdm.write(message, file=sys.stderr)
+
+
+def _build_hnsw_sidecar_with_progress(
+    ids,
+    vectors,
+    *,
+    m: int,
+    ef_construction: int,
+    ef_search: int,
+    model_slug: str,
+) -> faiss.IndexIDMap2:
+    if vectors.ndim != 2:
+        raise RuntimeError(f"Expected 2D vectors array, got shape {vectors.shape}")
+    dim = int(vectors.shape[1])
+    base = faiss.IndexHNSWFlat(dim, int(m), faiss.METRIC_INNER_PRODUCT)
+    base.hnsw.efConstruction = int(ef_construction)
+    base.hnsw.efSearch = int(ef_search)
+    index = faiss.IndexIDMap2(base)
+    total = int(len(ids))
+    if total == 0:
+        return index
+
+    desc = f"hnsw [{model_slug}]"
+    with tqdm(total=total, desc=desc, unit="vec", file=sys.stderr) as pbar:
+        for start in range(0, total, DEFAULT_ADD_BATCH_SIZE):
+            end = min(total, start + DEFAULT_ADD_BATCH_SIZE)
+            index.add_with_ids(vectors[start:end], ids[start:end])
+            pbar.update(end - start)
+    return index
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     load_dotenv()
     args = parse_args(argv)
+    total_t0 = time.monotonic()
 
     model = (args.model or os.environ.get("EMBEDDING_MODEL") or "").strip()
     if not model:
@@ -96,9 +134,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.out_dir is not None
         else data_dir / "embeddings" / _slugify_model(model)
     ).resolve()
+    model_slug = out_dir.name
     flat_path = out_dir / FLAT_INDEX_FILENAME
     hnsw_path = out_dir / HNSW_INDEX_FILENAME
     state_path = out_dir / "state.sqlite"
+
+    _log(f"Building HNSW sidecar for model={model!r}")
+    _log(f"Canonical flat index: {flat_path}")
+    _log(f"HNSW sidecar output: {hnsw_path}")
+    _log(
+        f"HNSW parameters: M={args.m}, efConstruction={args.ef_construction}, efSearch={args.ef_search}"
+    )
 
     if hnsw_path.exists() and not args.force:
         print(
@@ -106,22 +152,44 @@ def main(argv: Iterable[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if hnsw_path.exists() and args.force:
+        _log(f"Overwriting existing HNSW sidecar: {hnsw_path}")
 
     try:
+        load_t0 = time.monotonic()
+        _log("Loading canonical flat index ...")
         flat_index = load_index(flat_path)
         ids, vectors = extract_flat_ids_and_vectors(flat_index)
-        hnsw_index = build_hnsw_index(
+        load_dt = time.monotonic() - load_t0
+        dim = int(vectors.shape[1]) if vectors.ndim == 2 else 0
+        _log(
+            f"Loaded {len(ids)} vectors (dim={dim}) from canonical flat index in {load_dt:.2f}s"
+        )
+
+        build_t0 = time.monotonic()
+        _log("Building HNSW graph ...")
+        hnsw_index = _build_hnsw_sidecar_with_progress(
             ids,
             vectors,
             m=args.m,
             ef_construction=args.ef_construction,
             ef_search=args.ef_search,
+            model_slug=model_slug,
         )
+        build_dt = time.monotonic() - build_t0
+        _log(f"Built HNSW graph in {build_dt:.2f}s")
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
+    write_t0 = time.monotonic()
+    _log(f"Writing HNSW sidecar to {hnsw_path} ...")
     _atomic_write_index(hnsw_index, hnsw_path)
+    write_dt = time.monotonic() - write_t0
+    _log(f"Wrote HNSW sidecar in {write_dt:.2f}s")
+
+    meta_t0 = time.monotonic()
+    _log(f"Updating state metadata in {state_path} ...")
     state_conn = _connect_state(state_path)
     try:
         upsert_state_meta(
@@ -138,10 +206,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         state_conn.commit()
     finally:
         state_conn.close()
+    meta_dt = time.monotonic() - meta_t0
+    total_dt = time.monotonic() - total_t0
+    _log(f"Updated state metadata in {meta_dt:.2f}s")
 
     print(
         f"Built HNSW sidecar: {hnsw_path} "
-        f"({hnsw_index.ntotal} vectors, M={args.m}, efConstruction={args.ef_construction}, efSearch={args.ef_search})"
+        f"({hnsw_index.ntotal} vectors, M={args.m}, efConstruction={args.ef_construction}, "
+        f"efSearch={args.ef_search}, total={total_dt:.2f}s)"
     )
     return 0
 

@@ -6,7 +6,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import faiss
 import numpy as np
@@ -41,10 +41,11 @@ class BuildHnswTests(unittest.TestCase):
             state_conn.close()
 
             stdout = io.StringIO()
+            stderr = io.StringIO()
             old_env = os.environ.copy()
             os.environ["EMBEDDING_MODEL"] = "test-model"
             try:
-                with redirect_stdout(stdout):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
                     rc = main(["--out-dir", str(out_dir)])
             finally:
                 os.environ.clear()
@@ -57,6 +58,13 @@ class BuildHnswTests(unittest.TestCase):
             self.assertEqual(meta["hnsw_built_from_ntotal"], "2")
             self.assertEqual(meta["hnsw_built_from_dim"], "2")
             self.assertIn("Built HNSW sidecar", stdout.getvalue())
+            err = stderr.getvalue()
+            self.assertIn("Loading canonical flat index", err)
+            self.assertIn("Loaded 2 vectors", err)
+            self.assertIn("Building HNSW graph", err)
+            self.assertIn("hnsw [test-model]", err)
+            self.assertIn("Writing HNSW sidecar", err)
+            self.assertIn("Updating state metadata", err)
 
 
 if __name__ == "__main__":
