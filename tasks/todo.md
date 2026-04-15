@@ -101,3 +101,16 @@
 - The final success line still prints to stdout, but the operational progress and timings are emitted to stderr for terminal visibility.
 - Expanded `tests/test_build_hnsw.py` to assert the verbose builder output.
 - Verification: `python -m py_compile src/pubmed_embeddings/build_hnsw.py tests/test_build_hnsw.py`, `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_build_hnsw tests.test_query tests.test_embeddings`, and `uv run pubmed-build-hnsw --help`.
+
+## HNSW Builder Memory
+
+- [x] Reduce peak RAM for `pubmed-build-hnsw` so large sidecar builds do not crash the server.
+- [x] Verify the lower-memory build path with targeted tests.
+
+### HNSW Builder Memory Review
+
+- `pubmed-build-hnsw` now memory-maps the canonical flat `vectors.faiss` and reconstructs vectors batch-by-batch instead of materializing the full vector matrix in Python memory before HNSW insertion.
+- Added `--batch-size` (default `10000`) so tight-memory servers can trade speed for lower temporary RAM during HNSW build.
+- Builder logs now explicitly state that it is streaming vector reconstruction from the canonical flat index to reduce peak RAM.
+- Expanded `tests/test_build_hnsw.py` to assert mmap loading, batch-oriented builder output, and the reconstruction batch helper.
+- Verification: `python -m py_compile src/pubmed_embeddings/index_utils.py src/pubmed_embeddings/build_hnsw.py tests/test_build_hnsw.py` and `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_build_hnsw tests.test_query tests.test_embeddings`.

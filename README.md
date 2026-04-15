@@ -255,9 +255,16 @@ Useful flags:
 - `--m 32` sets the HNSW neighbor graph width.
 - `--ef-construction 200` sets the build-time recall/latency tradeoff.
 - `--ef-search 128` stores the default runtime search depth for queries.
+- `--batch-size 10000` controls how many vectors are reconstructed/added at a time during HNSW build; lower it if RAM is tight.
 - `--force` overwrites an existing sidecar.
 
-The builder reads `data/embeddings/<model-slug>/vectors.faiss`, writes `vectors.hnsw.faiss`, and records the build parameters plus the canonical flat `ntotal`/`dim` in `state.sqlite`. If embedding continues and the canonical flat index changes, `pubmed-query` will detect the stale sidecar and fall back to exact flat search until you rebuild HNSW.
+The builder memory-maps the canonical flat index and reconstructs vectors in batches to reduce peak RAM during HNSW build. It then writes `vectors.hnsw.faiss` and records the build parameters plus the canonical flat `ntotal`/`dim` in `state.sqlite`. If embedding continues and the canonical flat index changes, `pubmed-query` will detect the stale sidecar and fall back to exact flat search until you rebuild HNSW.
+
+If the server is memory-constrained:
+
+- reduce `--batch-size` (for example `2000` or `5000`)
+- avoid building HNSW while large embedding jobs are still active on the same machine
+- rebuild on a separate host if the canonical flat index itself is already close to the machine's RAM limit
 
 ## Query the index
 
