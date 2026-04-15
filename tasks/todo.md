@@ -40,3 +40,50 @@
 - Downloader: local files are re-downloaded when remote size cannot be confirmed instead of being silently skipped as unchanged.
 - Stats: aggregation now streams rows and keeps only the numeric word-count series needed for histogram/percentile calculation.
 - Verification: `uv run python -m py_compile src/pubmed_embeddings/*.py tests/*.py`, `.venv/bin/python -m unittest discover -s tests -q`, `uv run pubmed-tei-cluster --help`, `uv run pubmed-embed --help`, `uv run pubmed-download --help`, and `uv run pubmed-stats --help`.
+
+## Current Review Task
+
+- [x] Inspect the current query and retrieval implementation paths.
+- [x] Verify query behavior with targeted tests or runnable commands.
+- [x] Summarize current query-system quality, limitations, and recommended next steps.
+
+### Query Review Notes
+
+- `pubmed-embed` currently builds and resumes FAISS indices, but there is no separate query/search CLI or API in `pyproject.toml` scripts.
+- `src/pubmed_embeddings/embeddings.py` defines index creation, checkpointing, shard merge, and pending-article SQL selection, but no retrieval call site (`index.search(...)`) or query embedding flow.
+- README documents index output and says downstream search should use the merged canonical index, but does not document an implemented query command.
+- Automated coverage for “query” is limited to the SQL that selects pending articles for embedding in `tests/test_embeddings.py`; there are no semantic retrieval tests.
+- Verification attempt: `uv run pytest -q tests/test_embeddings.py` initially failed because `PYTHONPATH=src` was missing; rerun with `PYTHONPATH=src` then failed because `faiss` is not importable in the current environment even though `faiss-cpu` is declared in `pyproject.toml`.
+
+## Query CLI Implementation
+
+- [x] Add a dedicated `pubmed-query` CLI entry point and module.
+- [x] Reuse the existing embedding backends (`ollama`, `local`, `tei-http`) to embed a user query with the same model selection rules.
+- [x] Search the merged canonical FAISS index and hydrate PMIDs back to article metadata from SQLite.
+- [x] Add targeted tests for query retrieval and output formatting.
+- [x] Update README and review notes with usage and verification results.
+
+### Query CLI Review
+
+- Added `pubmed-query` as a package entry point and implemented `src/pubmed_embeddings/query.py`.
+- Query execution now embeds free-text input with the configured backend, searches the merged canonical `vectors.faiss`, and joins returned PMIDs back to SQLite article metadata.
+- Added JSON output plus terminal-friendly text output with title, year, journal, score, and abstract preview.
+- Added `tests/test_query.py` covering FAISS ranking, metadata hydration, preview formatting, and a mocked CLI-level JSON flow through `main()`.
+- Verification: `python -m py_compile src/pubmed_embeddings/query.py tests/test_query.py`, `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_query tests.test_embeddings`, `PYTHONPATH=src .venv/bin/python -m pubmed_embeddings.query --help`, and `uv run pubmed-query --help`.
+
+## HNSW Query Acceleration
+
+- [x] Add an HNSW sidecar build CLI that reads the canonical flat index and writes `vectors.hnsw.faiss`.
+- [x] Keep the flat index as the canonical write/resume artifact while recording enough metadata to detect stale HNSW sidecars.
+- [x] Update `pubmed-query` to prefer HNSW when valid, allow flat-only queries, and fall back cleanly to flat when the sidecar is missing or stale.
+- [x] Add tests for HNSW build, query-side selection/fallback, and output metadata.
+- [x] Update README and review notes with the new HNSW workflow and verification results.
+
+### HNSW Review
+
+- Added shared FAISS index helpers in `src/pubmed_embeddings/index_utils.py`.
+- Added `pubmed-build-hnsw` in `src/pubmed_embeddings/build_hnsw.py` to build `vectors.hnsw.faiss` from the canonical flat `vectors.faiss` and record HNSW metadata in `state.sqlite`.
+- Flat index checkpoints and merges now store `ntotal` and `query_index_type=flat` in `state.sqlite`, which lets queries detect when a previously built HNSW sidecar is stale after canonical flat index changes.
+- `pubmed-query` now prefers HNSW when the sidecar exists and matches the canonical flat metadata, supports `--hnsw-ef-search` and `--flat-only`, falls back to flat with a warning when HNSW is stale or unusable, and reports the selected index type in text and JSON output.
+- Added `tests/test_build_hnsw.py` plus expanded `tests/test_query.py` coverage for HNSW selection, stale-sidecar fallback, flat-only behavior, and builder metadata.
+- Verification: `python -m py_compile src/pubmed_embeddings/index_utils.py src/pubmed_embeddings/build_hnsw.py src/pubmed_embeddings/query.py tests/test_build_hnsw.py tests/test_query.py`, `PYTHONPATH=src .venv/bin/python -m unittest -q tests.test_build_hnsw tests.test_query tests.test_embeddings`, `uv run pubmed-build-hnsw --help`, and `uv run pubmed-query --help`.

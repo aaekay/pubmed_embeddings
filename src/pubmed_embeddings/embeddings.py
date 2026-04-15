@@ -19,6 +19,8 @@ import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from pubmed_embeddings.index_utils import upsert_state_meta
+
 
 STOP_EVENT = threading.Event()
 
@@ -130,6 +132,26 @@ def _connect_state(path: pathlib.Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def _record_flat_index_meta(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    dim: int,
+    source: str,
+    ntotal: int,
+) -> None:
+    upsert_state_meta(
+        conn,
+        {
+            "model": model,
+            "dim": dim,
+            "embedding_source": source,
+            "ntotal": ntotal,
+            "query_index_type": "flat",
+        },
+    )
 
 
 def _reconcile_faiss_ids_into_state(conn: sqlite3.Connection, index: faiss.Index) -> None:
@@ -596,17 +618,12 @@ def _merge_embedding_shards(out_dir: pathlib.Path, model: str, source: str) -> i
         "INSERT OR IGNORE INTO embedded_pmids (pmid) VALUES (?)",
         [(p,) for p in sorted(seen)],
     )
-    state_conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-        ("model", model),
-    )
-    state_conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-        ("dim", str(_index_dim(merged))),
-    )
-    state_conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-        ("embedding_source", source),
+    _record_flat_index_meta(
+        state_conn,
+        model=model,
+        dim=_index_dim(merged),
+        source=source,
+        ntotal=int(merged.ntotal),
     )
     state_conn.commit()
     state_conn.close()
@@ -1024,17 +1041,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         if not isinstance(index, (faiss.IndexIDMap, faiss.IndexIDMap2)):
             raise RuntimeError("Saved index must be IndexIDMap / IndexIDMap2")
         _reconcile_faiss_ids_into_state(state_conn, index)
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("model", model),
-        )
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("dim", str(_index_dim(index))),
-        )
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("embedding_source", source),
+        _record_flat_index_meta(
+            state_conn,
+            model=model,
+            dim=_index_dim(index),
+            source=source,
+            ntotal=int(index.ntotal),
         )
         state_conn.commit()
 
@@ -1075,17 +1087,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             "INSERT OR IGNORE INTO embedded_pmids (pmid) VALUES (?)",
             [(pmid,) for pmid in since_ck],
         )
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("model", model),
-        )
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("dim", str(_index_dim(index_obj))),
-        )
-        state_conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            ("embedding_source", source),
+        _record_flat_index_meta(
+            state_conn,
+            model=model,
+            dim=_index_dim(index_obj),
+            source=source,
+            ntotal=int(index_obj.ntotal),
         )
         state_conn.commit()
         since_ck.clear()

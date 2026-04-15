@@ -207,12 +207,13 @@ Embeddings are computed in the same Python process; vectors are L2-normalized be
 
 Output layout (example for `bge-m3`):
 
-- `data/embeddings/bge-m3/vectors.faiss` — L2-normalized vectors in `IndexIDMap2` over `IndexFlatIP` (cosine via inner product)
-- `data/embeddings/bge-m3/state.sqlite` — `embedded_pmids` for resume; PMIDs are also reconciled from the FAISS id map on startup
+- `data/embeddings/bge-m3/vectors.faiss` — canonical L2-normalized flat vectors in `IndexIDMap2` over `IndexFlatIP` (cosine via inner product)
+- `data/embeddings/bge-m3/state.sqlite` — `embedded_pmids` for resume plus metadata about the current canonical query artifact
+- `data/embeddings/bge-m3/vectors.hnsw.faiss` — optional query-time HNSW sidecar built from the canonical flat index
 
 **Second model** (e.g. `bge-large-en-v1.5`): change `EMBEDDING_MODEL` or pass `--model bge-large-en-v1.5` so output goes under `data/embeddings/bge-large-en-v1.5/` (separate index and state). That short name is resolved to the Hugging Face repo `BAAI/bge-large-en-v1.5` for download; you can also set the full id explicitly.
 
-**Checkpointing:** every `--checkpoint-every` PMIDs (or `EMBEDDING_CHECKPOINT_EVERY`), the **entire** FAISS index is written atomically (`*.tmp` then replace) and PMIDs are recorded in `state.sqlite`. Default is **5000** for **local** runs and **50** for **Ollama** when neither env nor CLI is set—large local jobs should use **thousands–tens of thousands** to avoid spending most time on disk once indices are huge. Each checkpoint logs wall time to stderr (e.g. `Checkpoint: ntotal=… vectors, 12.34s`).
+**Checkpointing:** every `--checkpoint-every` PMIDs (or `EMBEDDING_CHECKPOINT_EVERY`), the **entire canonical flat FAISS index** is written atomically (`*.tmp` then replace) and PMIDs are recorded in `state.sqlite`. Default is **5000** for **local** runs and **50** for **Ollama** when neither env nor CLI is set—large local jobs should use **thousands–tens of thousands** to avoid spending most time on disk once indices are huge. Each checkpoint logs wall time to stderr (e.g. `Checkpoint: ntotal=… vectors, 12.34s`). If you build an HNSW sidecar, rebuild it after the canonical flat index changes.
 
 **Stop and resume:** Ctrl+C sets a stop flag; after the current request, a final checkpoint runs. Re-run the same command to continue; already embedded PMIDs are skipped.
 
@@ -239,7 +240,57 @@ Use **multiple processes** to embed disjoint PMID subsets in parallel. Partition
 - **Resume:** Shards skip PMIDs already in their shard DB or in the **merged** canonical `state.sqlite` (if present). After a successful merge, re-embedding those PMIDs requires clearing state or using a fresh output directory.
 - **Advanced:** `--shard-id` / `--num-shards` are used by spawned workers; run the coordinator with `--workers` only (not combined with `--shard-id` on the same command).
 
-Downstream search should use the **merged** canonical index under `data/embeddings/<slug>/`, not individual shard folders.
+Downstream search should use the **merged** canonical index under `data/embeddings/<slug>/`, not individual shard folders. HNSW sidecars are built from that canonical flat index after merge; they are not maintained per shard.
+
+### Build an HNSW sidecar
+
+Keep `vectors.faiss` as the canonical write/resume artifact and build `vectors.hnsw.faiss` separately for faster queries:
+
+```bash
+uv run pubmed-build-hnsw --data-dir data
+```
+
+Useful flags:
+
+- `--m 32` sets the HNSW neighbor graph width.
+- `--ef-construction 200` sets the build-time recall/latency tradeoff.
+- `--ef-search 128` stores the default runtime search depth for queries.
+- `--force` overwrites an existing sidecar.
+
+The builder reads `data/embeddings/<model-slug>/vectors.faiss`, writes `vectors.hnsw.faiss`, and records the build parameters plus the canonical flat `ntotal`/`dim` in `state.sqlite`. If embedding continues and the canonical flat index changes, `pubmed-query` will detect the stale sidecar and fall back to exact flat search until you rebuild HNSW.
+
+## Query the index
+
+After building a **merged** canonical FAISS index, query it with the same `EMBEDDING_MODEL` and `EMBEDDING_SOURCE` that were used for indexing.
+
+```bash
+uv run pubmed-query "cancer immunotherapy biomarkers"
+```
+
+Useful flags:
+
+- `--top-k 5` limits the number of hits returned.
+- `--abstract-chars 0` suppresses abstract previews.
+- `--hnsw-ef-search 192` overrides the runtime HNSW search depth when the HNSW sidecar is used.
+- `--flat-only` forces exact search against `vectors.faiss`.
+- `--json` emits machine-readable output.
+- `--model ...`, `--data-dir ...`, and `--out-dir ...` mirror `pubmed-embed`.
+
+Example:
+
+```bash
+EMBEDDING_SOURCE=local \
+EMBEDDING_MODEL=BAAI/bge-large-en-v1.5 \
+uv run pubmed-query --top-k 5 --json "triple negative breast cancer immunotherapy"
+```
+
+The query tool:
+
+- embeds the free-text query with the configured backend (`ollama`, `local`, or `tei-http`)
+- prefers `data/embeddings/<model-slug>/vectors.hnsw.faiss` when it is present and still matches the canonical flat metadata; otherwise it falls back to `vectors.faiss`
+- joins the returned PMIDs back to `articles` in `data/pubmed.sqlite`
+- prints cosine-style similarity scores because the stored vectors are L2-normalized inner-product vectors
+- reports which index type (`hnsw` or `flat`) was used in both text and JSON output
 
 **Throughput / memory:** For **local**, three workers each load a full copy of the model—raise `TEI_BATCH_SIZE` / `LOCAL_EMBED_BATCH_SIZE` gradually while watching **GPU memory** and **system RAM**. If workers die with exit code **-9** (SIGKILL), the OS may have **OOM-killed** the process; lower batch size or worker count. Prefer a **large** `EMBEDDING_CHECKPOINT_EVERY` (e.g. **10000–50000** for long multi-shard runs) so checkpoints stay fast as shard indices grow.
 
